@@ -22,7 +22,7 @@ import {
 export default function DashboardPage() {
   // 模型与 Colab 状态
   const [availableModels, setAvailableModels] = useState<string[]>([]);
-  const [selectedModel, setSelectedModel] = useState<string>("gemini-3.8-flash");
+  const [selectedModel, setSelectedModel] = useState<string>("gemini-3.5-flash");
   const [colabStatus, setColabStatus] = useState<any>({
     online: false,
     state: "OFFLINE",

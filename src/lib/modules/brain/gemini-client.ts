@@ -1,13 +1,44 @@
 import { GoogleGenAI } from "@google/genai";
+import fs from "fs";
+import path from "path";
 
 let cachedModels: string[] = [];
 let lastFetchTime = 0;
 const CACHE_TTL_MS = 60 * 1000; // 缓存 1 分钟
 
 /**
+ * 确保在各种运行环境 (Next.js / Vitest / CLI) 下均能可靠加载 .env
+ */
+function ensureEnvLoaded() {
+  if (process.env.GEMINI_API_KEY) return;
+  try {
+    const envPath = path.resolve(process.cwd(), ".env");
+    if (fs.existsSync(envPath)) {
+      const content = fs.readFileSync(envPath, "utf-8");
+      for (const line of content.split("\n")) {
+        const match = line.match(/^\s*([\w.-]+)\s*=\s*(.*)?\s*$/);
+        if (match) {
+          let val = match[2] || "";
+          if (
+            (val.startsWith('"') && val.endsWith('"')) ||
+            (val.startsWith("'") && val.endsWith("'"))
+          ) {
+            val = val.slice(1, -1);
+          }
+          if (!process.env[match[1]]) {
+            process.env[match[1]] = val;
+          }
+        }
+      }
+    }
+  } catch (e) {}
+}
+
+/**
  * 获取 GoogleGenAI 客户端实例
  */
 export function getGeminiClient(): GoogleGenAI {
+  ensureEnvLoaded();
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
     throw new Error("GEMINI_API_KEY 未配置！请在 .env 中设置 Google AI Studio API Key。");
@@ -41,10 +72,12 @@ export async function listAvailableGeminiModels(): Promise<string[]> {
       }
     }
 
-    // 排序：将 3.8 / flash 排在最前
+    // 排序：将 3.5-flash 排在最前，其次为 3.5-flash-lite / 3.6-flash
     models.sort((a, b) => {
-      if (a.includes("3.8-flash")) return -1;
-      if (b.includes("3.8-flash")) return 1;
+      if (a === "gemini-3.5-flash") return -1;
+      if (b === "gemini-3.5-flash") return 1;
+      if (a.includes("3.5-flash") && !b.includes("3.5-flash")) return -1;
+      if (!a.includes("3.5-flash") && b.includes("3.5-flash")) return 1;
       if (a.includes("flash") && !b.includes("flash")) return -1;
       if (!a.includes("flash") && b.includes("flash")) return 1;
       return a.localeCompare(b);
@@ -55,14 +88,14 @@ export async function listAvailableGeminiModels(): Promise<string[]> {
     return cachedModels;
   } catch (error) {
     console.warn("[GEMINI] 动态获取模型列表失败，使用安全兜底列表:", error);
-    // 兜底常用模型
-    return ["gemini-3.8-flash", "gemini-3.8-pro", "gemini-2.5-flash", "gemini-2.0-flash"];
+    // 兜底常用稳定模型
+    return ["gemini-3.5-flash", "gemini-3.5-flash-lite", "gemini-3.6-flash"];
   }
 }
 
 /**
- * 获取默认推荐模型 (优先读取环境变量，默认 gemini-3.8-flash)
+ * 获取默认推荐模型 (优先读取环境变量，默认锁定稳定的 gemini-3.5-flash)
  */
 export function getDefaultGeminiModel(): string {
-  return process.env.DEFAULT_GEMINI_MODEL || "gemini-3.8-flash";
+  return process.env.DEFAULT_GEMINI_MODEL || "gemini-3.5-flash";
 }
