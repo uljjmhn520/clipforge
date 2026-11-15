@@ -1,0 +1,174 @@
+import { db } from "@/lib/db";
+import { projects, scripts, cloudTasks, compositions, Shot } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
+import { colabClient } from "../colab-rpc/client";
+
+export class TaskManager {
+  /**
+   * 1. 创建项目草稿
+   */
+  public async createProject(data: {
+    name: string;
+    productName: string;
+    productCategory?: string;
+    productDescription: string;
+    productPrice?: string;
+    productImages?: string[];
+  }) {
+    const [project] = await db.insert(projects).values({
+      name: data.name,
+      productName: data.productName,
+      productCategory: data.productCategory,
+      productDescription: data.productDescription,
+      productPrice: data.productPrice,
+      productImages: data.productImages || [],
+      status: "draft",
+    }).returning();
+
+    return project;
+  }
+
+  /**
+   * 2. 更新脚本与分镜 (判官质检通过后)
+   */
+  public async updateProjectScript(projectId: string, scriptData: {
+    title: string;
+    shots: Shot[];
+    judgeReport?: any;
+    externalPrompt?: string;
+  }) {
+    // 检查锁状态：若已经在云端运行，禁止修改
+    await this.assertNotLocked(projectId);
+
+    const [script] = await db.insert(scripts).values({
+      projectId,
+      title: scriptData.title,
+      shots: scriptData.shots,
+      judgeReport: scriptData.judgeReport,
+      externalPrompt: scriptData.externalPrompt,
+    }).returning();
+
+    await db.update(projects).set({
+      status: "grid_reviewing",
+      updatedAt: new Date(),
+    }).where(eq(projects.id, projectId));
+
+    return script;
+  }
+
+  /**
+   * 3. ⚠️ 强人工审核闸门：用户确认九宫格关键帧通过！
+   * 只有人工点击此操作，任务才被允许进入云端队列
+   */
+  public async approveGrid(projectId: string) {
+    await this.assertNotLocked(projectId);
+
+    await db.update(projects).set({
+      status: "grid_approved",
+      updatedAt: new Date(),
+    }).where(eq(projects.id, projectId));
+
+    console.log(`[STATE-MACHINE] 项目 ${projectId} 九宫格已人工审核通过！解锁云端视频生成权限。`);
+  }
+
+  /**
+   * 4. 提交至 Colab 视频生成队列 (加锁置灰)
+   */
+  public async submitToCloudQueue(projectId: string, sessionName?: string) {
+    const project = await db.query.projects.findFirst({
+      where: eq(projects.id, projectId),
+    });
+
+    if (!project) throw new Error("项目不存在");
+    if (project.status !== "grid_approved") {
+      throw new Error("门禁拦截：九宫格关键帧尚未通过人工审核，禁止提交云端任务！");
+    }
+
+    const script = await db.query.scripts.findFirst({
+      where: eq(scripts.projectId, projectId),
+    });
+
+    if (!script || !script.shots) throw new Error("项目未包含有效分镜数据");
+
+    const session = sessionName || process.env.COLAB_SESSION_NAME || "clipforge_helloworld1234";
+
+    // 🔒 状态跃迁至 cloud_running，前端加锁置灰！
+    await db.update(projects).set({
+      status: "cloud_running",
+      updatedAt: new Date(),
+    }).where(eq(projects.id, projectId));
+
+    // 逐镜生成 cloud_tasks 并追加至 Colab inbox.jsonl
+    for (const shot of script.shots) {
+      const driveOutputPath = `${process.env.COLAB_DRIVE_OUTPUT_DIR || "/content/drive/MyDrive/ClipForge/outputs"}/${projectId}_shot_${shot.id}.mp4`;
+
+      const [task] = await db.insert(cloudTasks).values({
+        projectId,
+        shotId: shot.id,
+        sessionName: session,
+        state: "submitted_to_inbox",
+        isLocked: true, // 锁定防修改
+        driveOutputPath,
+      }).returning();
+
+      // 向 Colab /content/inbox.jsonl 追加文件行
+      try {
+        await colabClient.pushTaskToInbox({
+          taskId: task.id,
+          type: "video",
+          prompt: shot.description,
+          durationSec: shot.durationSec,
+          driveOutputPath,
+        });
+      } catch (err: any) {
+        console.warn(`[STATE-MACHINE] Colab 离线或写入 inbox 异常，任务在本地排队: ${err.message}`);
+        await db.update(cloudTasks).set({ state: "waiting_for_cloud" }).where(eq(cloudTasks.id, task.id));
+      }
+    }
+  }
+
+  /**
+   * 5. 云端任务完成回调
+   */
+  public async onCloudTaskCompleted(taskId: string, driveFile: string) {
+    await db.update(cloudTasks).set({
+      state: "done_in_drive",
+      isLocked: false,
+      driveOutputPath: driveFile,
+      updatedAt: new Date(),
+    }).where(eq(cloudTasks.id, taskId));
+
+    console.log(`[STATE-MACHINE] 云端任务 ${taskId} 已完成并在 Drive 落盘: ${driveFile}`);
+  }
+
+  /**
+   * 6. 完成最终成片记录
+   */
+  public async completeProject(projectId: string, outputPath: string, durationSec: number, fileSizeMb: string) {
+    await db.insert(compositions).values({
+      projectId,
+      outputPath,
+      durationSec,
+      fileSizeMb,
+    });
+
+    await db.update(projects).set({
+      status: "completed",
+      updatedAt: new Date(),
+    }).where(eq(projects.id, projectId));
+
+    console.log(`[STATE-MACHINE] 项目 ${projectId} 已全部交付成片: ${outputPath}`);
+  }
+
+  private async assertNotLocked(projectId: string) {
+    const runningTask = await db.query.cloudTasks.findFirst({
+      where: eq(cloudTasks.projectId, projectId),
+    });
+
+    if (runningTask && runningTask.isLocked && runningTask.state === "generating") {
+      throw new Error("操作被拒绝：该项目分镜当前正在云端全力渲染中，处于只读锁定保护状态！");
+    }
+  }
+}
+
+export const taskManager = new TaskManager();

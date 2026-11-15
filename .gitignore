@@ -1,2 +1,25 @@
-temp
-tmp
+# Dependencies
+node_modules/
+.tools/
+
+# Next.js
+.next/
+out/
+next-env.d.ts
+
+# Production & Local Data
+data/
+*.sqlite
+*.sqlite-journal
+
+# Environment files
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Temporary & Archive
+temp/
+tmp/
+*.log
