@@ -14,6 +14,12 @@ export async function POST(req: Request) {
     const body = await req.json();
     const { action, minutes } = body;
 
+    if (action === "power_on" || action === "start") {
+      const gpu = body.gpu || "L4";
+      const result = await colabClient.powerOn(gpu);
+      return NextResponse.json(result);
+    }
+
     if (action === "keep_alive") {
       colabClient.sendKeepAlive(minutes || 15);
       return NextResponse.json({ success: true, message: `已成功向 Colab 续命 ${minutes || 15} 分钟！` });

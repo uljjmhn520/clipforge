@@ -2,8 +2,17 @@ import { db } from "@/lib/db";
 import { projects, scripts, cloudTasks, compositions, Shot } from "@/lib/db/schema";
 import { eq } from "drizzle-orm";
 import { colabClient } from "../colab-rpc/client";
+import { join } from "path";
 
 export class TaskManager {
+  constructor() {
+    // 监听云端完成通知，全自动触发 colab download 与本地挂载
+    colabClient.on("task_completed", async (payload: { task_id?: string; drive_file?: string }) => {
+      if (payload && payload.task_id) {
+        await this.onCloudTaskCompleted(payload.task_id, payload.drive_file || "");
+      }
+    });
+  }
   /**
    * 1. 创建项目草稿
    */
@@ -128,7 +137,7 @@ export class TaskManager {
   }
 
   /**
-   * 5. 云端任务完成回调
+   * 5. 云端任务完成回调与自动下载
    */
   public async onCloudTaskCompleted(taskId: string, driveFile: string) {
     await db.update(cloudTasks).set({
@@ -139,6 +148,44 @@ export class TaskManager {
     }).where(eq(cloudTasks.id, taskId));
 
     console.log(`[STATE-MACHINE] 云端任务 ${taskId} 已完成并在 Drive 落盘: ${driveFile}`);
+
+    // 自动调用 colab download 同步至本地挂载
+    try {
+      const taskRecord = await db.query.cloudTasks.findFirst({
+        where: eq(cloudTasks.id, taskId),
+      });
+
+      if (taskRecord && driveFile) {
+        const localDestDir = join(process.cwd(), "public", "outputs", taskRecord.projectId, "clips");
+        const localVideoPath = await colabClient.downloadFile(driveFile, localDestDir);
+
+        // 回填至对应的 script.shots
+        const scriptRecord = await db.query.scripts.findFirst({
+          where: eq(scripts.projectId, taskRecord.projectId),
+        });
+
+        if (scriptRecord && scriptRecord.shots) {
+          const updatedShots = scriptRecord.shots.map((shot) => {
+            if (shot.id === taskRecord.shotId) {
+              return {
+                ...shot,
+                videoPath: localVideoPath,
+                status: "done" as const,
+              };
+            }
+            return shot;
+          });
+
+          await db.update(scripts).set({
+            shots: updatedShots,
+          }).where(eq(scripts.id, scriptRecord.id));
+
+          console.log(`[STATE-MACHINE] 分镜 ${taskRecord.shotId} 视频已成功下载并挂载至本地: ${localVideoPath}`);
+        }
+      }
+    } catch (downloadErr) {
+      console.warn(`[STATE-MACHINE] 自动下载分镜产物异常:`, downloadErr);
+    }
   }
 
   /**

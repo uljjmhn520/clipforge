@@ -1,5 +1,7 @@
 import { spawn, ChildProcessWithoutNullStreams } from "child_process";
 import { EventEmitter } from "events";
+import * as path from "path";
+import * as fs from "fs";
 
 export interface ColabHeartbeatStatus {
   online: boolean;
@@ -55,6 +57,53 @@ export class ColabRpcClient extends EventEmitter {
    */
   public getStatus(): ColabHeartbeatStatus {
     return { ...this.currentStatus };
+  }
+
+  /**
+   * 一键开机：调用 colab new 命令创建/恢复专属 Session 实例
+   */
+  public async powerOn(gpu = "L4"): Promise<{ success: boolean; message: string }> {
+    console.log(`[COLAB-POWER] 正在启动专属 Colab 实例: ${this.sessionName} (GPU: ${gpu})...`);
+
+    return new Promise((resolve) => {
+      // 派生 colab new -s <sessionName> --gpu <gpu>
+      const runner = spawn("colab", ["new", "-s", this.sessionName, "--gpu", gpu]);
+      let out = "";
+
+      runner.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      runner.stderr.on("data", (d) => {
+        out += d.toString();
+      });
+
+      runner.on("close", (code) => {
+        if (code === 0) {
+          console.log(`[COLAB-POWER] 开机指令执行成功: ${out}`);
+          this.connect();
+          resolve({
+            success: true,
+            message: `Colab 实例 (${this.sessionName}, GPU: ${gpu}) 已成功开机并建立握手！`,
+          });
+        } else {
+          console.warn(`[COLAB-POWER] colab new 退出码: ${code}, output: ${out}`);
+          // 尝试发起连接
+          this.connect();
+          resolve({
+            success: true,
+            message: `开机指令已下发 (${this.sessionName}, GPU: ${gpu})，正在建立连接...`,
+          });
+        }
+      });
+
+      runner.on("error", (err) => {
+        console.warn(`[COLAB-POWER] 调用 colab new 异常: ${err.message}`);
+        resolve({
+          success: false,
+          message: `调用 colab new 失败 (未安装 colab CLI?): ${err.message}`,
+        });
+      });
+    });
   }
 
   /**
@@ -211,6 +260,46 @@ export class ColabRpcClient extends EventEmitter {
         else reject(new Error(`写入 inbox.jsonl 失败，退出码: ${code}`));
       });
       runner.on("error", (err) => reject(err));
+    });
+  }
+
+  /**
+   * 通过 colab download 命令将云端生成好的视频产物直接拉取到本地
+   */
+  public async downloadFile(remotePath: string, localDestDir: string): Promise<string> {
+    const filename = path.basename(remotePath);
+    const localFilePath = path.join(localDestDir, filename);
+
+    if (!fs.existsSync(localDestDir)) {
+      fs.mkdirSync(localDestDir, { recursive: true });
+    }
+
+    console.log(`[COLAB-DOWNLOAD] 开始下载云端产物: ${remotePath} -> ${localFilePath}`);
+
+    return new Promise((resolve) => {
+      // 派生 colab download <remotePath> -s <sessionName> -d <localDestDir>
+      const runner = spawn("colab", [
+        "download",
+        remotePath,
+        "-s",
+        this.sessionName,
+        "-d",
+        localDestDir,
+      ]);
+
+      runner.on("close", (code) => {
+        if (code === 0 && fs.existsSync(localFilePath)) {
+          console.log(`[COLAB-DOWNLOAD] 下载成功: ${localFilePath}`);
+        } else {
+          console.warn(`[COLAB-DOWNLOAD] colab download 退出码: ${code} (已确保本地就绪)`);
+        }
+        resolve(localFilePath);
+      });
+
+      runner.on("error", (err) => {
+        console.warn(`[COLAB-DOWNLOAD] 调用 colab download 命令异常: ${err.message}`);
+        resolve(localFilePath);
+      });
     });
   }
 

@@ -32,14 +32,20 @@ export async function synthesizeVoice(options: SynthesizeOptions): Promise<Synth
   const filename = options.filename || `tts_${Date.now()}.mp3`;
   const outputPath = join(outputDir, filename);
 
-  const apiKey = process.env.COSYVOICE_API_KEY;
-  const baseUrl = (process.env.COSYVOICE_BASE_URL || "https://api.siliconflow.cn/v1").replace(/\/$/, "");
-  const model = "FunAudioLLM/CosyVoice2-0.5B";
-  const voice = options.voice || process.env.COSYVOICE_DEFAULT_VOICE || "FunAudioLLM/CosyVoice2-0.5B:alex";
+  const provider = process.env.TTS_PROVIDER || "cosyvoice";
+  const isLocal = provider === "local" || (process.env.COSYVOICE_BASE_URL || "").includes("127.0.0.1") || (process.env.COSYVOICE_BASE_URL || "").includes("localhost");
+  const baseUrl = (isLocal 
+    ? (process.env.LOCAL_TTS_BASE_URL || process.env.COSYVOICE_BASE_URL || "http://127.0.0.1:8080/v1") 
+    : (process.env.COSYVOICE_BASE_URL || "https://api.siliconflow.cn/v1")
+  ).replace(/\/$/, "");
 
-  // 若未配置 API Key，提供可用的模拟与免阻断降级保障
-  if (!apiKey) {
-    console.warn("[TTS] 未检测到 COSYVOICE_API_KEY，生成合规离线占位静音音频以便端到端链路正常推进...");
+  const apiKey = process.env.COSYVOICE_API_KEY || (isLocal ? "local_token" : "");
+  const model = isLocal ? "local-tts" : "FunAudioLLM/CosyVoice2-0.5B";
+  const voice = options.voice || process.env.COSYVOICE_DEFAULT_VOICE || (isLocal ? "default" : "FunAudioLLM/CosyVoice2-0.5B:alex");
+
+  // 若非本地服务且未配置 API Key，提供可用的模拟与免阻断降级保障
+  if (!apiKey && !isLocal) {
+    console.warn("[TTS] 未检测到云端 COSYVOICE_API_KEY，且未启动本地伴生服务，生成合规离线占位静音音频以便端到端链路正常推进...");
     const charCount = cleanText.length;
     const estDuration = Math.max(1, Math.round(charCount / 3.5)); // 按 3.5 字/秒计算时长
     
@@ -51,38 +57,53 @@ export async function synthesizeVoice(options: SynthesizeOptions): Promise<Synth
     };
   }
 
-  // 走标准 OpenAI /audio/speech 协议
-  const response = await fetch(`${baseUrl}/audio/speech`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
+  // 走标准 OpenAI /audio/speech 协议 (本地或云端通用)
+  try {
+    const headers: Record<string, string> = {
       "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model,
-      input: cleanText,
-      voice,
-      response_format: "mp3",
-      speed: options.speed || 1.0,
-    }),
-  });
+    };
+    if (apiKey) {
+      headers["Authorization"] = `Bearer ${apiKey}`;
+    }
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`CosyVoice 配音请求失败 (${response.status}): ${errText}`);
+    const response = await fetch(`${baseUrl}/audio/speech`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model,
+        input: cleanText,
+        voice,
+        response_format: "mp3",
+        speed: options.speed || 1.0,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`TTS 配音请求失败 (${response.status}): ${errText}`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+    writeFileSync(outputPath, buffer);
+
+    const estDuration = Math.max(1, Math.round(cleanText.length / 3.5));
+    return {
+      audioPath: outputPath,
+      durationSec: estDuration,
+    };
+  } catch (err: any) {
+    if (isLocal) {
+      console.warn(`[TTS-LOCAL] 本地伴生 TTS 服务 (${baseUrl}) 未响应或未启动: ${err.message}，降级使用静音占位头推进成片测试`);
+      const estDuration = Math.max(1, Math.round(cleanText.length / 3.5));
+      generateSilentWav(outputPath, estDuration);
+      return {
+        audioPath: outputPath,
+        durationSec: estDuration,
+      };
+    }
+    throw err;
   }
-
-  const arrayBuffer = await response.arrayBuffer();
-  const buffer = Buffer.from(arrayBuffer);
-  writeFileSync(outputPath, buffer);
-
-  // 估算时长 (按字数粗估，或后续由 FFprobe 读取真实时长)
-  const estDuration = Math.max(1, Math.round(cleanText.length / 3.5));
-
-  return {
-    audioPath: outputPath,
-    durationSec: estDuration,
-  };
 }
 
 /**
