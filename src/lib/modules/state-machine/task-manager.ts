@@ -1,9 +1,10 @@
 import { db } from "@/lib/db";
 import { projects, scripts, cloudTasks, compositions, Shot } from "@/lib/db/schema";
-import { eq } from "drizzle-orm";
+import { eq, and, gt } from "drizzle-orm";
 import { colabClient } from "../colab-rpc/client";
 import { slice3x3GridImage } from "../storyboard/slicer";
 import { join } from "path";
+import { existsSync, readFileSync } from "fs";
 
 export class TaskManager {
   constructor() {
@@ -142,7 +143,11 @@ export class TaskManager {
     });
 
     if (!project) throw new Error("项目不存在");
-    if (project.status !== "grid_approved") {
+    if (
+      project.status !== "grid_approved" &&
+      project.status !== "cloud_running" &&
+      project.status !== "completed"
+    ) {
       throw new Error("门禁拦截：九宫格关键帧尚未通过人工审核，禁止提交云端任务！");
     }
 
@@ -160,31 +165,61 @@ export class TaskManager {
       updatedAt: new Date(),
     }).where(eq(projects.id, projectId));
 
-    // 逐镜生成 cloud_tasks 并追加至 Colab inbox.jsonl
+    // 检查项目已有的分镜视频任务 (过滤掉 shotId === 0 的九宫格生图任务)
+    const existingVideoTasks = await db.query.cloudTasks.findMany({
+      where: and(eq(cloudTasks.projectId, projectId), gt(cloudTasks.shotId, 0)),
+    });
+
     for (const shot of script.shots) {
-      const driveOutputPath = `${process.env.COLAB_DRIVE_OUTPUT_DIR || "/content/drive/MyDrive/ClipForge/outputs"}/${projectId}_shot_${shot.id}.mp4`;
+      const existingTask = existingVideoTasks.find((t) => t.shotId === shot.id);
+      const driveOutputPath = `${process.env.COLAB_DRIVE_OUTPUT_DIR || "/content/outputs"}/${projectId}_shot_${shot.id}.mp4`;
 
-      const [task] = await db.insert(cloudTasks).values({
-        projectId,
-        shotId: shot.id,
-        sessionName: session,
-        state: "submitted_to_inbox",
-        isLocked: true, // 锁定防修改
-        driveOutputPath,
-      }).returning();
+      let taskToPush = existingTask;
 
-      // 向 Colab /content/inbox.jsonl 追加文件行
-      try {
-        await colabClient.pushTaskToInbox({
-          taskId: task.id,
-          type: "video",
-          prompt: shot.description,
-          durationSec: shot.durationSec,
+      if (!existingTask) {
+        const [newTask] = await db.insert(cloudTasks).values({
+          projectId,
+          shotId: shot.id,
+          sessionName: session,
+          state: "submitted_to_inbox",
+          isLocked: true,
           driveOutputPath,
-        });
-      } catch (err: any) {
-        console.warn(`[STATE-MACHINE] Colab 离线或写入 inbox 异常，任务在本地排队: ${err.message}`);
-        await db.update(cloudTasks).set({ state: "waiting_for_cloud" }).where(eq(cloudTasks.id, task.id));
+        }).returning();
+        taskToPush = newTask;
+      }
+
+      // 获取关键帧切片 (Base64 形式打包下发)
+      let keyframeBase64: string | undefined = undefined;
+      const candidatePaths = [
+        shot.keyframePath,
+        join(process.cwd(), "public", "uploads", projectId, "slices", `shot_0${shot.id}.png`),
+        join(process.cwd(), "public", "uploads", projectId, "slices", `shot_${shot.id}.png`),
+      ].filter(Boolean) as string[];
+
+      for (const p of candidatePaths) {
+        if (existsSync(p)) {
+          try {
+            keyframeBase64 = readFileSync(p).toString("base64");
+            break;
+          } catch (_) {}
+        }
+      }
+
+      if (taskToPush) {
+        try {
+          await colabClient.pushTaskToInbox({
+            taskId: taskToPush.id,
+            type: "video",
+            prompt: shot.description,
+            durationSec: shot.durationSec,
+            keyframeBase64,
+            driveOutputPath: taskToPush.driveOutputPath || driveOutputPath,
+          });
+          await db.update(cloudTasks).set({ state: "submitted_to_inbox" }).where(eq(cloudTasks.id, taskToPush.id));
+        } catch (err: any) {
+          console.warn(`[STATE-MACHINE] Colab 离线或写入 inbox 异常，任务在本地排队: ${err.message}`);
+          await db.update(cloudTasks).set({ state: "waiting_for_cloud" }).where(eq(cloudTasks.id, taskToPush.id));
+        }
       }
     }
   }

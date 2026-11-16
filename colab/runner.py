@@ -120,6 +120,16 @@ def handle_stdin_rpc():
                 sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
                 sys.stdout.flush()
 
+            elif method == "task.enqueue":
+                # 将任务追加写入 /content/inbox.jsonl
+                task_data = req.get("params", {})
+                print(f"[RUNNER] 收到任务入队请求: {task_data.get('task_id')}", flush=True)
+                with open(INBOX_PATH, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(task_data, ensure_ascii=False) + "\n")
+                resp = {"jsonrpc": "2.0", "id": msg_id, "result": {"success": True, "task_id": task_data.get("task_id")}}
+                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+                sys.stdout.flush()
+
             elif method == "colab.terminate":
                 # 手动立即关机
                 resp = {"jsonrpc": "2.0", "id": msg_id, "result": {"terminating": True}}
@@ -135,7 +145,7 @@ def process_single_task(task: Dict[str, Any]) -> Dict[str, Any]:
     task_id = task.get("task_id", "unknown")
     task_type = task.get("type", "video") # "image" (九宫格) 或 "video"
     prompt = task.get("prompt", "")
-    drive_output_path = task.get("drive_output_path", f"/content/drive/MyDrive/ClipForge/outputs/{task_id}.mp4")
+    drive_output_path = task.get("drive_output_path", f"/content/outputs/{task_id}.mp4")
 
     print(f"[TASK] 开始处理任务 {task_id} (类型: {task_type})", flush=True)
     t0 = time.time()

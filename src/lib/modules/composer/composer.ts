@@ -66,9 +66,14 @@ export async function composeVideo(options: ComposeOptions): Promise<{ outputPat
   // 1. 构建 FFmpeg 命令实例
   const command = ffmpeg();
 
-  // 添加所有视频片段输入
+  // 添加所有视频片段输入 (兼容真实 mp4 与静态关键帧图片)
   clips.forEach((clip) => {
-    command.input(clip.videoPath);
+    const isImage = /\.(png|jpe?g|webp)$/i.test(clip.videoPath);
+    if (isImage) {
+      command.input(clip.videoPath).inputOptions(["-loop 1", `-t ${clip.durationSec || 5}`]);
+    } else {
+      command.input(clip.videoPath);
+    }
   });
 
   // 添加所有音频片段输入
@@ -85,11 +90,12 @@ export async function composeVideo(options: ComposeOptions): Promise<{ outputPat
   const filterGraph: string[] = [];
   const normalizedVideoTags: string[] = [];
 
-  // 规范化每一个视频流 (720x1280 竖屏, 30fps, square pixels)
-  clips.forEach((_, idx) => {
+  // 规范化每一个视频流 (1080x1920 竖屏, 30fps, 自动克隆末帧对齐时长)
+  clips.forEach((clip, idx) => {
     const normTag = `v_norm_${idx}`;
+    const dur = clip.durationSec || 5;
     filterGraph.push(
-      `[${idx}:v]scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,format=yuv420p,setsar=1,fps=30,settb=AVTB[${normTag}]`
+      `[${idx}:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,format=yuv420p,setsar=1,fps=30,settb=AVTB,tpad=stop_mode=clone:stop_duration=${dur},trim=duration=${dur}[${normTag}]`
     );
     normalizedVideoTags.push(`[${normTag}]`);
   });
@@ -109,7 +115,7 @@ export async function composeVideo(options: ComposeOptions): Promise<{ outputPat
     const badgeTag = `v_badge`;
     const badgeText = escapeDrawText("AI 辅助生成");
     filterGraph.push(
-      `[${currentVideoTag}]drawtext=${fontArg}text='${badgeText}':fontsize=24:fontcolor=white@0.85:box=1:boxcolor=black@0.4:boxborderw=6:x=w-tw-30:y=40:enable='between(t,0,3)'[${badgeTag}]`
+      `[${currentVideoTag}]drawtext=${fontArg}text='${badgeText}':fontsize=30:fontcolor=white@0.85:box=1:boxcolor=black@0.45:boxborderw=8:x=w-tw-40:y=50:enable='between(t,0,3)'[${badgeTag}]`
     );
     currentVideoTag = badgeTag;
   }
@@ -124,9 +130,9 @@ export async function composeVideo(options: ComposeOptions): Promise<{ outputPat
         const start = accumulatedTime + card.startTime;
         const end = accumulatedTime + card.endTime;
 
-        // 底部居中字幕卡 (带半透明底框)
+        // 底部居中字幕卡 (带半透明底框，适配 1080p 竖屏 UI 避空区)
         filterGraph.push(
-          `[${currentVideoTag}]drawtext=${fontArg}text='${escaped}':fontsize=36:fontcolor=white:borderw=2:bordercolor=black@0.8:box=1:boxcolor=black@0.45:boxborderw=8:x=(w-tw)/2:y=h-th-140:enable='between(t,${start.toFixed(2)},${end.toFixed(2)})'[${subTag}]`
+          `[${currentVideoTag}]drawtext=${fontArg}text='${escaped}':fontsize=48:fontcolor=white:borderw=3:bordercolor=black@0.85:box=1:boxcolor=black@0.45:boxborderw=10:x=(w-tw)/2:y=h-th-220:enable='between(t,${start.toFixed(2)},${end.toFixed(2)})'[${subTag}]`
         );
         currentVideoTag = subTag;
       });
@@ -156,10 +162,13 @@ export async function composeVideo(options: ComposeOptions): Promise<{ outputPat
       .outputOptions([
         "-map", `[${currentVideoTag}]`,
         ...(finalAudioTag ? ["-map", `[${finalAudioTag}]`] : []),
-        "-c:v", "libx264", // 亦可尝试 h264_nvenc
-        "-preset", "veryfast",
-        "-crf", "23",
+        "-c:v", "libx264",
+        "-preset", "medium",
+        "-b:v", "3500k",
+        "-maxrate", "5000k",
+        "-bufsize", "7000k",
         "-pix_fmt", "yuv420p",
+        ...(finalAudioTag ? ["-c:a", "aac", "-b:a", "192k", "-ar", "44100"] : []),
         "-metadata", "comment=AIGC;GeneratedByClipForge",
       ])
       .output(outputPath)

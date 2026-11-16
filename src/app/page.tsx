@@ -24,7 +24,9 @@ import {
   ExternalLink,
   ChevronRight,
   Eye,
-  Lock
+  Lock,
+  Trash2,
+  Download
 } from "lucide-react";
 
 export default function DashboardPage() {
@@ -220,6 +222,114 @@ export default function DashboardPage() {
     setFinalVideoUrl("");
     setActiveStep(1);
     setActiveTab("workspace");
+  };
+
+  // 智能卖点提炼
+  const [isExtractingSellingPoints, setIsExtractingSellingPoints] = useState(false);
+  const handleExtractSellingPoints = async () => {
+    if (!productName.trim()) {
+      alert("请先填写商品名称！");
+      return;
+    }
+    setIsExtractingSellingPoints(true);
+    try {
+      const res = await fetch("/api/brain/selling-points", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ productName, model: selectedModel }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+
+      if (data.category) setCategory(data.category);
+      if (data.suggestedPrice) setPrice(data.suggestedPrice);
+      if (data.description) setDescription(data.description);
+    } catch (err: any) {
+      alert(`提炼卖点失败: ${err.message}`);
+    } finally {
+      setIsExtractingSellingPoints(false);
+    }
+  };
+
+  // 删除项目
+  const handleDeleteProject = async (id: string, name: string) => {
+    if (!confirm(`确定要彻底删除项目「${name || "未命名"}」及其本地生成的所有产物吗？`)) {
+      return;
+    }
+    try {
+      const res = await fetch(`/api/projects?id=${id}`, { method: "DELETE" });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      alert("项目已成功删除！");
+      if (currentProjectId === id) {
+        handleNewProject();
+      }
+      fetchProjects();
+    } catch (err: any) {
+      alert(`删除失败: ${err.message}`);
+    }
+  };
+
+  const copyToClipboard = async (text: string) => {
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+    } catch (_) {}
+    try {
+      const textArea = document.createElement("textarea");
+      textArea.value = text;
+      textArea.style.position = "fixed";
+      textArea.style.left = "-999999px";
+      textArea.style.top = "-999999px";
+      document.body.appendChild(textArea);
+      textArea.focus();
+      textArea.select();
+      document.execCommand("copy");
+      textArea.remove();
+    } catch (e) {
+      console.warn("Clipboard fallback failed:", e);
+    }
+  };
+
+  // 复制项目台词文案
+  const handleCopyProjectScript = async (projectId: string) => {
+    try {
+      const res = await fetch(`/api/projects?id=${projectId}`);
+      const data = await res.json();
+      const shots = data.script?.shots || [];
+      if (!shots.length) {
+        alert("该项目暂无可用台词文案！");
+        return;
+      }
+      const text = shots
+        .map(
+          (s: any, idx: number) =>
+            `【镜头 ${idx + 1} · ${s.type || "分镜"}】\n画面：${s.description}\n台词：${s.voiceover}`
+        )
+        .join("\n\n");
+      await copyToClipboard(text);
+      alert("完整分镜台词文案已成功复制到剪贴板！");
+    } catch (err: any) {
+      alert(`获取文案失败: ${err.message}`);
+    }
+  };
+
+  const handleCopyAllVoiceovers = async () => {
+    const list = scriptData?.shots || [];
+    if (!list.length) {
+      alert("暂无可复制的台词！");
+      return;
+    }
+    const text = list
+      .map(
+        (s: any, idx: number) =>
+          `【镜头 ${idx + 1} · ${s.type || "分镜"}】\n画面：${s.description}\n台词：${s.voiceover}`
+      )
+      .join("\n\n");
+    await copyToClipboard(text);
+    alert("完整分镜台词文案已成功复制到剪贴板！");
   };
 
   // Colab 一键开机
@@ -607,7 +717,18 @@ export default function DashboardPage() {
                   </h2>
 
                   <div>
-                    <label className="block text-xs font-semibold text-zinc-300 mb-1.5">商品名称</label>
+                    <div className="flex items-center justify-between mb-1.5">
+                      <label className="text-xs font-semibold text-zinc-300">商品名称</label>
+                      <button
+                        type="button"
+                        onClick={handleExtractSellingPoints}
+                        disabled={isExtractingSellingPoints}
+                        className="text-[11px] text-emerald-400 hover:text-emerald-300 flex items-center gap-1 font-medium bg-emerald-500/10 hover:bg-emerald-500/20 px-2 py-0.5 rounded-lg border border-emerald-500/20 transition cursor-pointer disabled:opacity-50"
+                      >
+                        <Sparkles className="w-3 h-3" />
+                        {isExtractingSellingPoints ? "AI 提炼中..." : "✨ AI 智能提炼卖点"}
+                      </button>
+                    </div>
                     <input
                       type="text"
                       value={productName}
@@ -729,8 +850,8 @@ export default function DashboardPage() {
 
                   <div className="flex items-center gap-3">
                     <button
-                      onClick={() => {
-                        navigator.clipboard.writeText(scriptData.prompts?.googleFlow || "");
+                      onClick={async () => {
+                        await copyToClipboard(scriptData.prompts?.googleFlow || "");
                         setPromptCopied(true);
                         setTimeout(() => setPromptCopied(false), 2000);
                       }}
@@ -929,13 +1050,24 @@ export default function DashboardPage() {
                     <div className="aspect-[9/16] max-w-xs mx-auto rounded-xl overflow-hidden border border-zinc-800 shadow-2xl">
                       <video src={finalVideoUrl} controls autoPlay className="w-full h-full object-cover" />
                     </div>
-                    <a
-                      href={finalVideoUrl}
-                      download="clipforge_final.mp4"
-                      className="inline-block px-5 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs text-zinc-200 transition"
-                    >
-                      下载成片 MP4
-                    </a>
+                    <div className="flex items-center justify-center gap-3">
+                      <a
+                        href={finalVideoUrl}
+                        download="clipforge_final.mp4"
+                        className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold transition shadow-lg shadow-emerald-500/20"
+                      >
+                        <Download className="w-4 h-4" />
+                        下载成片 MP4
+                      </a>
+                      <button
+                        type="button"
+                        onClick={handleCopyAllVoiceovers}
+                        className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-xs font-bold text-zinc-200 transition"
+                      >
+                        <Copy className="w-4 h-4 text-amber-400" />
+                        复制完整台词文案
+                      </button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -1041,6 +1173,30 @@ export default function DashboardPage() {
                         </span>
                       )}
 
+                      {/* 复制文案按钮 */}
+                      <button
+                        type="button"
+                        onClick={() => handleCopyProjectScript(item.id)}
+                        className="px-2.5 py-1.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium flex items-center gap-1 transition"
+                        title="复制该项目完整分镜脚本与台词"
+                      >
+                        <Copy className="w-3.5 h-3.5 text-amber-400" />
+                        文案
+                      </button>
+
+                      {/* 下载成片按钮 */}
+                      {item.videoUrl && (
+                        <a
+                          href={item.videoUrl}
+                          download={`${item.name || "video"}.mp4`}
+                          className="px-2.5 py-1.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium flex items-center gap-1 transition"
+                          title="下载成片 MP4"
+                        >
+                          <Download className="w-3.5 h-3.5 text-cyan-400" />
+                          下载
+                        </a>
+                      )}
+
                       {/* 跳转工作台按钮 */}
                       <button
                         onClick={() => handleLoadProject(item.id)}
@@ -1048,6 +1204,16 @@ export default function DashboardPage() {
                       >
                         载入工作台
                         <ChevronRight className="w-3.5 h-3.5 text-emerald-400" />
+                      </button>
+
+                      {/* 删除项目按钮 */}
+                      <button
+                        type="button"
+                        onClick={() => handleDeleteProject(item.id, item.name)}
+                        className="p-1.5 rounded-xl bg-zinc-800 hover:bg-red-500/20 text-zinc-400 hover:text-red-400 transition"
+                        title="彻底删除该视频项目"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
                       </button>
                     </div>
                   </div>

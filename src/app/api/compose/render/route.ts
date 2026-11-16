@@ -40,25 +40,33 @@ export async function POST(req: Request) {
 
     for (let i = 0; i < script.shots.length; i++) {
       const shot = script.shots[i];
-      const shotDuration = shot.durationSec || 5;
-      totalEstimatedSeconds += shotDuration;
+      const baseDuration = shot.durationSec || 5;
 
-      // 生成配音
+      // 生成配音 (优先高质量 Edge-TTS)
       const ttsRes = await synthesizeVoice({
         text: shot.voiceover,
         outputDir: audioDir,
         filename: `shot_${shot.id}_audio.mp3`,
       });
 
-      // 生成字幕卡
-      const cards = splitIntoCaptionCards(shot.voiceover, 0, shotDuration);
+      // 动态自适应时长：确保视频片段时长完整容纳语音配音
+      const actualDuration = Math.max(baseDuration, Math.ceil(ttsRes.durationSec));
+      totalEstimatedSeconds += actualDuration;
 
-      // 视频路径：优先使用生成好的视频，若未就绪则使用关键帧静态图片或占位
-      const videoSource = shot.videoPath || shot.keyframePath || join(process.cwd(), "public", "examples", "tissue.png");
+      // 生成字幕卡
+      const cards = splitIntoCaptionCards(shot.voiceover, 0, actualDuration);
+
+      // 视频路径：优先使用生成好的视频，若未就绪则使用关键帧静态图片或系统占位图
+      let videoSource = shot.videoPath;
+      if (!videoSource || !existsSync(videoSource)) {
+        videoSource = shot.keyframePath && existsSync(shot.keyframePath)
+          ? shot.keyframePath
+          : join(process.cwd(), "public", "placeholder.png");
+      }
 
       clips.push({
         videoPath: videoSource,
-        durationSec: shotDuration,
+        durationSec: actualDuration,
         narrationAudioPath: ttsRes.audioPath,
         captionCards: cards,
       });

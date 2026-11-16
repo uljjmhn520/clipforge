@@ -2,6 +2,8 @@ import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { projects, scripts, compositions, cloudTasks } from "@/lib/db/schema";
 import { desc, eq } from "drizzle-orm";
+import * as path from "path";
+import * as fs from "fs";
 
 export async function GET(req: Request) {
   try {
@@ -92,6 +94,33 @@ export async function GET(req: Request) {
     );
 
     return NextResponse.json({ projects: enrichedList });
+  } catch (error: any) {
+    return NextResponse.json({ error: error.message }, { status: 500 });
+  }
+}
+
+export async function DELETE(req: Request) {
+  try {
+    const { searchParams } = new URL(req.url);
+    const projectId = searchParams.get("id");
+
+    if (!projectId) {
+      return NextResponse.json({ error: "缺少 projectId 参数" }, { status: 400 });
+    }
+
+    // 级联清理本地生成的文件与目录
+    const projectDir = path.join(process.cwd(), "public", "outputs", projectId);
+    if (fs.existsSync(projectDir)) {
+      fs.rmSync(projectDir, { recursive: true, force: true });
+    }
+
+    // 级联清理数据库记录
+    await db.delete(compositions).where(eq(compositions.projectId, projectId));
+    await db.delete(cloudTasks).where(eq(cloudTasks.projectId, projectId));
+    await db.delete(scripts).where(eq(scripts.projectId, projectId));
+    await db.delete(projects).where(eq(projects.id, projectId));
+
+    return NextResponse.json({ success: true, message: `项目 ${projectId} 及其关联资源已成功彻底删除` });
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }

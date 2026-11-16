@@ -99,3 +99,10 @@ export async function listAvailableGeminiModels(): Promise<string[]> {
 export function getDefaultGeminiModel(): string {
   return process.env.DEFAULT_GEMINI_MODEL || "gemini-3.5-flash";
 }
+
+/**
+ * 解析有效可用的模型名称
+ */
+export function resolveWorkingModel(model?: string): string {
+  return model || getDefaultGeminiModel();
+}

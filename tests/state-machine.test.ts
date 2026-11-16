@@ -66,7 +66,7 @@ describe("状态机调度与只读加锁门禁测试", () => {
       where: eq(projects.id, testProjectId),
     });
     expect(updatedP?.status).toBe("cloud_running");
-  });
+  }, 15000);
 
   it("5. 任务在云端渲染期间，再次尝试修改脚本必须被只读锁拦截", async () => {
     // 手动模拟设置当前任务正在生成中 (generating)

@@ -1,6 +1,6 @@
-# 核心系统模块拆解与接口设计规范 (v2.5 文件队列与断线重连定案版)
+# 核心系统模块拆解与接口设计规范 (v2.6 OpenSSH 隧道与无侵入环境定案版)
 
-本文档将系统拆解为 **6 个高内聚、低耦合的内部模块** 与 **1 个独立的 Colab 云端协议运行器**，明确各模块的职责边界、输入输出契约、基于文件追加 (Append-Only) 的高容错通信队列、以及基于 stdio 的 JSON-RPC 心跳机制。
+本文档将系统拆解为 **6 个高内聚、低耦合的内部模块** 与 **1 个独立的 Colab 云端协议运行器**，明确各模块的职责边界、输入输出契约、基于 OpenSSH 隧道 (`colab ssh`) 的非阻塞通信与 Append-Only 高容错任务队列、以及基于 stdio 的 JSON-RPC 心跳机制。
 
 ---
 
@@ -17,9 +17,9 @@ clipforge/
 ├── src/
 │   ├── app/                        # 【Web 交互层】Next.js App Router (UI 与 API Routes)
 │   │   ├── api/                    # 纯净 API 接口层 (亦可直接对外暴露为 MCP Tools)
-│   │   │   ├── brain/              # 脚本与模型 API (Gemini 3.8 动态列表/生成/质检)
-│   │   │   ├── storyboard/         # 九宫格处理 (切片/单格替换/审核通过)
-│   │   │   ├── colab/              # Colab 专属 Session 会话控制与批量提交
+│   │   │   ├── brain/              # 脚本与模型 API (Gemini 动态列表/生成/质检)
+│   │   │   ├── storyboard/         # 九宫格处理 (切片/单格替换/审核通过/MiniMax云端直出)
+│   │   │   ├── colab/              # Colab 专属 Session 会话控制与批量提交 (开机/SSH隧道/心跳)
 │   │   │   ├── audio/              # 配音与语音转写 (CosyVoice/Whisper)
 │   │   │   └── compose/            # 最终混音渲染与多格式导出
 │   │   └── (dashboard)/            # 现代化前端界面 (新建/脚本审片/九宫格审核台/Colab实时监控/作品瀑布流)
@@ -30,7 +30,7 @@ clipforge/
 │   │   └── modules/                # 【核心业务逻辑层】6 大功能子系统
 │   │       ├── brain/              # 模块 1：创意与判官大脑
 │   │       ├── storyboard/         # 模块 2：九宫格几何切片与外部提示词导出
-│   │       ├── colab-rpc/          # 模块 3：基于 Append 文件队列与 stdio 心跳的容错客户端
+│   │       ├── colab-rpc/          # 模块 3：基于 OpenSSH 隧道 (colab ssh) 与文件队列的容错客户端
 │   │       ├── audio/              # 模块 4：商业合规配音与时间戳对齐引擎
 │   │       ├── composer/           # 模块 5：FFmpeg NVENC 硬件压制与字幕混音引擎
 │   │       └── state-machine/      # 模块 6：任务全生命周期调度与只读锁
@@ -42,53 +42,61 @@ clipforge/
 
 ---
 
-## 二、 文件持久化队列与断线重连机制 (`modules/colab-rpc/`)
+## 二、 OpenSSH 隧道与文件持久化队列机制 (`modules/colab-rpc/`)
 
-为了解决 `colab exec` 在执行数分钟长任务时因本地 WiFi 抖动、网络重连导致管道断开的痛点，系统确立**“基于文件的 Append-Only 持久化任务日志队列”**：
+为避免原 `colab exec` 命令因同步阻塞导致的调用端进程锁死与偶发网络中断痛点，系统全面换用 **`colab ssh`** 作为底层传输通道，并配合 **“基于文件的 Append-Only 持久化任务日志队列”**：
 
 ```
 [本地 Node.js 客户端]                                 [云端 Colab L4/A100 实例]
         │                                                         │
-        │ 1. 任务推送 (append 模式写入临时文件)                    │
+        │ 1. 任务推送 (通过 colab ssh 独立追加写入临时文件)        │
         ├────────────────────────────────────────────────────────►│  追加写入: /content/inbox.jsonl
         │                                                         │         │
         │                                                         │         ▼
         │                                                         │  [runner.py 逐行消费游标]
         │                                                         │         │ 正在推理生成...
         │                                                         │         ▼
-        │                                                         │  视频写入 Google Drive
+        │                                                         │  视频/图片写入 Google Drive
         │                                                         │  结果写入: /content/outbox.jsonl
         │                                                         │         │
-        │ 2. 重连后自动补录 / 正常流式读取                        │         ▼
+        │ 2. 重连后自动补录 / 正常 SSH 流式回传                   │         ▼
         │◄────────────────────────────────────────────────────────┤  从 /content/outbox.jsonl 回传回执
         │                                                         │
 ```
 
-### 1. 队列文件规范（轻量高效，位于 Colab 实例磁盘 `/content/`）
+### 1. 方案 A：子进程运行时环境注入 (getColabEnv)
+* **OpenSSH ProxyCommand 适配**：`colab ssh` 启动时，SSH 客户端通过 ProxyCommand 命令调用 `/usr/bin/python3 -m colab_cli.cli`。
+* **无侵入运行时注入**：在 Node.js 中通过 `getColabEnv()`：
+  1. 确保 `PATH` 包含 `~/.local/bin`；
+  2. 动态读取 `~/.cache/uv/archive-v0/` 下全部子目录，拼接为 `PYTHONPATH` 传入派生子进程；
+  3. **效果**：系统级 `/usr/bin/python3` 无需修改全局环境即能定位 `colab_cli`，彻底避免影响宿主机上其他并行运行的 Colab 会话。
+
+### 2. 队列文件与并发机制（轻量高效，位于 Colab 实例磁盘 `/content/`）
 * **任务收件箱**：`/content/inbox.jsonl`
-  * 每当下发新分镜生成任务，本地向该文件以 `append` 形式追加一行完整的 JSON 指令（带唯一的 `task_id`）；
-  * 即使此时 `colab exec` 中断，任务内容已落入 Colab 磁盘，绝不丢失。
+  * 每当下发新分镜生成任务，本地通过独立的 SSH 命令 `colab ssh -s <session> -- "echo '...' >> /content/inbox.jsonl"` 追加写入；
+  * 该命令在独立的 SSH 进程中瞬间完成退出，**绝不阻塞主心跳管道**；
+  * 任务落入 Colab 磁盘，即使本地断网，云端任务绝不丢失。
 * **结果发件箱**：`/content/outbox.jsonl`
   * Colab 渲染完成一个分镜后，将生成的视频路径及耗时信息追加一行到 `outbox.jsonl`；
-  * 同时通过 `stdout` 进行常规输出；
+  * 同时通过长连接 SSH 的 `stdout` 进行常规事件通知；
 * **断线重连补录机制 (Resilient Reconnect)**：
-  * 若中间网络断连，本地重连后首先调用 `sync_outbox`，读取上次已知游标之后的所有 `outbox.jsonl` 记录；
+  * 若中间网络断连，本地重连后调用 `sync_outbox` 或通过 SSH 读取上次已知游标之后的所有 `outbox.jsonl` 记录；
   * 本地 SQLite 状态机平滑完成补录，**无需重复渲染，零重复计费，零丢单**。
 
-### 2. 超时与心跳参数（本地 `.env` 完全掌控）
+### 3. 超时与心跳参数（本地 `.env` 完全掌控）
 ```ini
-# --- colab exec 执行与心跳参数 ---
+# --- colab ssh 执行与心跳参数 ---
 COLAB_SESSION_NAME="clipforge_helloworld1234"
 
-# colab exec 单次交互/命令最大超时时间（秒），默认 600 秒（10分钟）
+# 单次交互/命令最大超时时间（秒），默认 600 秒（10分钟）
 COLAB_EXEC_TIMEOUT_SECONDS=600
 
 # 本地向 Colab 探测心跳的周期（秒），默认 15 秒
 COLAB_HEARTBEAT_INTERVAL_SECONDS=15
 ```
 
-### 3. 本地主动 Ping-Pong 轮询心跳协议
-本地由独立计时器每隔 15 秒向子进程 `stdin` 发送心跳帧，Colab 立即通过 `stdout` 响应：
+### 4. 本地主动 Ping-Pong 轮询心跳协议
+本地由独立计时器每隔 15 秒向 `colab ssh -s <session> -- python3 /content/runner.py` 子进程 `stdin` 发送心跳帧，Colab 立即通过 `stdout` 响应：
 
 * **本地 -> Colab (Ping 帧)**：
   ```json
@@ -130,12 +138,15 @@ COLAB_HEARTBEAT_INTERVAL_SECONDS=15
   3. 支持关键帧审查工作台的“单格替换”逻辑；
   4. 触发“人工审核确认通过”，解锁向云端下发任务的权限。
 
-### 模块 3：Colab 文件队列与断线重连客户端 (`src/lib/modules/colab-rpc/`)
+### 模块 3：Colab OpenSSH 通道与断线重连客户端 (`src/lib/modules/colab-rpc/`)
 * **职责**：
-  1. 封装向 Colab `/content/inbox.jsonl` 的追加任务写入逻辑；
-  2. 维护已接收结果的行号游标，断线重连时自动从 `/content/outbox.jsonl` 追溯补偿未确认的结果；
-  3. 启动并维护 `heartbeat.ping` 周期探测定时器，更新系统心跳健康表；
-  4. 接收 Google Drive 文件落盘路径，回传本地更新 SQLite。
+  1. 采用 OpenSSH 隧道 (`colab ssh`) 建立与 Colab 会话的稳定非阻塞连接；
+  2. 实现方案 A 运行时环境注入 (`getColabEnv`)，自动补齐 uv 归档依赖至 `PYTHONPATH`，杜绝代理子进程 ModuleNotFoundError；
+  3. 封装向 Colab `/content/inbox.jsonl` 的并发非阻塞追加任务写入逻辑；
+  4. 维护已接收结果的行号游标，断线重连时自动从 `/content/outbox.jsonl` 追溯补偿未确认的结果；
+  5. 启动并维护 `heartbeat.ping` 周期探测定时器，更新系统心跳健康表；
+  6. 提供 `execCommand` 接口执行任意非阻塞远端命令及状态巡检；
+  7. 接收 Google Drive 文件落盘路径，回传本地更新 SQLite 并通过 `colab download` 自动落盘。
 
 ### 模块 4：商业配音与时间戳对齐引擎 (`src/lib/modules/audio/`)
 * **职责**：

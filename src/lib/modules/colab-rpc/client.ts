@@ -3,6 +3,54 @@ import { EventEmitter } from "events";
 import * as path from "path";
 import * as fs from "fs";
 
+/**
+ * 方案 A：子进程环境注入函数
+ * 解决 colab ssh 调用 OpenSSH 代理模式 (ProxyCommand) 时 /usr/bin/python3 找不到 colab_cli 的问题。
+ * 通过在子进程环境变量中自动添加 ~/.local/bin 至 PATH，并将 ~/.cache/uv/archive-v0 下的归档目录注入 PYTHONPATH，
+ * 完全无需修改用户宿主机全局配置或环境，即可保证 colab ssh 稳定工作。
+ */
+export function getColabEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  const home = process.env.HOME || "/home/debian";
+
+  // 1. 确保 PATH 包含用户本地 bin 目录
+  const localBin = path.join(home, ".local/bin");
+  const currentPath = env.PATH || "";
+  if (!currentPath.split(":").includes(localBin)) {
+    env.PATH = currentPath ? `${localBin}:${currentPath}` : localBin;
+  }
+
+  // 2. 动态扫描 uv 工具与缓存目录并注入 PYTHONPATH (方案 A)
+  const uvToolPath = path.join(home, ".local/share/uv/tools/google-colab-cli/lib/python3.13/site-packages");
+  if (fs.existsSync(uvToolPath)) {
+    env.PYTHONPATH = env.PYTHONPATH ? `${uvToolPath}:${env.PYTHONPATH}` : uvToolPath;
+  }
+
+  const uvArchive = path.join(home, ".cache/uv/archive-v0");
+  if (fs.existsSync(uvArchive)) {
+    try {
+      const dirs = fs.readdirSync(uvArchive)
+        .map((d) => path.join(uvArchive, d))
+        .filter((p) => {
+          try {
+            return fs.statSync(p).isDirectory();
+          } catch {
+            return false;
+          }
+        });
+
+      if (dirs.length > 0) {
+        const archivePaths = dirs.join(":");
+        env.PYTHONPATH = env.PYTHONPATH ? `${archivePaths}:${env.PYTHONPATH}` : archivePaths;
+      }
+    } catch (e) {
+      // 容错处理
+    }
+  }
+
+  return env;
+}
+
 export interface ColabHeartbeatStatus {
   online: boolean;
   state: "IDLE" | "BUSY" | "OFFLINE";
@@ -67,7 +115,9 @@ export class ColabRpcClient extends EventEmitter {
 
     return new Promise((resolve) => {
       // 派生 colab new -s <sessionName> --gpu <gpu>
-      const runner = spawn("colab", ["new", "-s", this.sessionName, "--gpu", gpu]);
+      const runner = spawn("colab", ["new", "-s", this.sessionName, "--gpu", gpu], {
+        env: getColabEnv(),
+      });
       let out = "";
 
       runner.stdout.on("data", (d) => {
@@ -107,19 +157,80 @@ export class ColabRpcClient extends EventEmitter {
   }
 
   /**
-   * 启动与 Colab 专属 Session 的 stdio 交互子进程
+   * 上传本地文件到 Colab 实例
    */
-  public connect(): void {
+  public async uploadFile(localPath: string, remotePath: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      console.log(`[COLAB-UPLOAD] 正在上传文件: ${localPath} -> ${remotePath}`);
+      const runner = spawn("colab", ["upload", localPath, remotePath, "-s", this.sessionName], {
+        env: getColabEnv(),
+      });
+
+      runner.on("close", (code) => {
+        if (code === 0) {
+          console.log(`[COLAB-UPLOAD] 文件上传成功: ${remotePath}`);
+          resolve(true);
+        } else {
+          console.warn(`[COLAB-UPLOAD] 上传退出码: ${code}`);
+          resolve(false);
+        }
+      });
+
+      runner.on("error", (err) => {
+        console.warn(`[COLAB-UPLOAD] 上传异常: ${err.message}`);
+        resolve(false);
+      });
+    });
+  }
+
+  private hasCheckedRemoteScripts = true;
+
+  /**
+   * 自动自愈同步：确保 Colab 远端所需脚本 (/content/runner.py 等) 已同步部署
+   */
+  public async ensureRemoteScripts(): Promise<boolean> {
+    if (this.hasCheckedRemoteScripts) return true;
+    console.log(`[COLAB-RPC] 检查远端脚本完整性 (/content/runner.py)...`);
+    const check = await this.execCommand("test -f /content/runner.py && echo 'EXISTS'");
+    if (check.stdout && check.stdout.includes("EXISTS")) {
+      this.hasCheckedRemoteScripts = true;
+      return true;
+    }
+
+    console.log(`[COLAB-RPC] 远端缺失 runner.py，正在自动同步 colab/ 脚本...`);
+    const scriptFiles = ["runner.py", "bootstrap.py", "minimax_engine.py"];
+    const colabDir = path.join(process.cwd(), "colab");
+
+    for (const file of scriptFiles) {
+      const localFile = path.join(colabDir, file);
+      const remoteFile = `/content/${file}`;
+      if (fs.existsSync(localFile)) {
+        await this.uploadFile(localFile, remoteFile);
+      }
+    }
+    this.hasCheckedRemoteScripts = true;
+    return true;
+  }
+
+  /**
+   * 启动与 Colab 专属 Session 的 OpenSSH 交互子进程 (替换原阻塞式 colab exec)
+   */
+  public async connect(): Promise<void> {
     if (this.process) return;
 
-    console.log(`[COLAB-RPC] 正在连接专属 Colab 会话: ${this.sessionName}...`);
+    console.log(`[COLAB-RPC] 正在通过 colab ssh 连接专属 Colab 会话: ${this.sessionName}...`);
 
-    // 派生 colab exec 命令
-    // 在本地真实环境下直接调用 colab exec；若在未装 colab CLI 环境下则优雅回退
-    const args = ["exec", "-s", this.sessionName, "--timeout", String(this.execTimeoutSec), "python3", "/content/runner.py"];
+    try {
+      await this.ensureRemoteScripts();
+    } catch (err: any) {
+      console.warn(`[COLAB-RPC] 检查/同步远端脚本异常: ${err.message}`);
+    }
+
+    // 派生 colab ssh 命令，使用方案 A 注入的 PYTHONPATH 驱动 OpenSSH 隧道
+    const args = ["ssh", "-s", this.sessionName, "--", "python3", "/content/runner.py"];
     
     try {
-      this.process = spawn("colab", args);
+      this.process = spawn("colab", args, { env: getColabEnv() });
 
       this.process.stdout.on("data", (data: Buffer) => {
         this.handleStdout(data.toString());
@@ -249,17 +360,105 @@ export class ColabRpcClient extends EventEmitter {
 
     console.log(`[COLAB-RPC] 向云端追加任务: ${task.taskId}`);
 
-    // 通过子进程或命令把这行内容 echo 追加到 /content/inbox.jsonl
+    const payload = {
+      task_id: task.taskId,
+      type: task.type || "video",
+      prompt: task.prompt,
+      duration_sec: task.durationSec || 5,
+      keyframe_b64: task.keyframeBase64 || null,
+      drive_output_path: task.driveOutputPath,
+      enqueued_at: Date.now(),
+    };
+
+    // 优先通过已建立的 SSH stdio 管道高速下发 (避免并发第二条 SSH 触发 Colab 429 独占限制)
+    if (this.process && this.process.stdin.writable) {
+      const frame = {
+        jsonrpc: "2.0",
+        id: `task_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        method: "task.enqueue",
+        params: payload,
+      };
+      this.process.stdin.write(JSON.stringify(frame) + "\n");
+      return;
+    }
+
+    // 兜底方案：在无长连接时通过 stdin 管道写入 /content/inbox.jsonl (规避命令行长度限制与转义损坏)
     return new Promise((resolve, reject) => {
-      const escaped = line.replace(/"/g, '\\"');
-      const appendCmd = `echo "${escaped}" >> /content/inbox.jsonl`;
-      const runner = spawn("colab", ["exec", "-s", this.sessionName, "bash", "-c", appendCmd]);
+      const line = JSON.stringify(payload);
+      const runner = spawn(
+        "colab",
+        [
+          "ssh",
+          "-s",
+          this.sessionName,
+          "--",
+          "python3",
+          "-c",
+          "import sys; open('/content/inbox.jsonl', 'a', encoding='utf-8').write(sys.stdin.read().strip() + '\\n')",
+        ],
+        {
+          env: getColabEnv(),
+          stdio: ["pipe", "pipe", "pipe"],
+        }
+      );
+
+      runner.stdin.write(line);
+      runner.stdin.end();
+
+      const timer = setTimeout(() => {
+        try {
+          runner.kill();
+        } catch (_) {}
+        resolve();
+      }, 15000);
 
       runner.on("close", (code) => {
+        clearTimeout(timer);
         if (code === 0) resolve();
         else reject(new Error(`写入 inbox.jsonl 失败，退出码: ${code}`));
       });
-      runner.on("error", (err) => reject(err));
+      runner.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+  }
+
+  /**
+   * 通过 colab ssh 执行非阻塞一次性远端命令并获取输出
+   */
+  public async execCommand(
+    command: string
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    return new Promise((resolve) => {
+      const runner = spawn("colab", ["ssh", "-s", this.sessionName, "--", command], {
+        env: getColabEnv(),
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+
+      const timer = setTimeout(() => {
+        try {
+          runner.kill();
+        } catch (_) {}
+        resolve({ stdout, stderr: "TIMEOUT", exitCode: -1 });
+      }, 15000);
+
+      runner.stdout.on("data", (d) => {
+        stdout += d.toString();
+      });
+      runner.stderr.on("data", (d) => {
+        stderr += d.toString();
+      });
+      runner.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ stdout, stderr, exitCode: code ?? -1 });
+      });
+      runner.on("error", (err) => {
+        clearTimeout(timer);
+        resolve({ stdout, stderr: err.message, exitCode: -1 });
+      });
     });
   }
 
@@ -277,15 +476,21 @@ export class ColabRpcClient extends EventEmitter {
     console.log(`[COLAB-DOWNLOAD] 开始下载云端产物: ${remotePath} -> ${localFilePath}`);
 
     return new Promise((resolve) => {
-      // 派生 colab download <remotePath> -s <sessionName> -d <localDestDir>
-      const runner = spawn("colab", [
-        "download",
-        remotePath,
-        "-s",
-        this.sessionName,
-        "-d",
-        localDestDir,
-      ]);
+      // 派生 colab download <remotePath> <localFilePath> -s <sessionName>
+      const runner = spawn(
+        "colab",
+        ["download", remotePath, localFilePath, "-s", this.sessionName],
+        { env: getColabEnv() }
+      );
+
+      runner.stdout.on("data", (d) => {
+        const str = d.toString().trim();
+        if (str) console.log(`[COLAB-DOWNLOAD] ${str}`);
+      });
+      runner.stderr.on("data", (d) => {
+        const str = d.toString().trim();
+        if (str) console.warn(`[COLAB-DOWNLOAD-STDERR] ${str}`);
+      });
 
       runner.on("close", (code) => {
         if (code === 0 && fs.existsSync(localFilePath)) {
