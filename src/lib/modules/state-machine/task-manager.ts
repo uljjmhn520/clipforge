@@ -2,6 +2,7 @@ import { db } from "@/lib/db";
 import { projects, scripts, cloudTasks, compositions, Shot } from "@/lib/db/schema";
 import { eq } from "drizzle-orm";
 import { colabClient } from "../colab-rpc/client";
+import { slice3x3GridImage } from "../storyboard/slicer";
 import { join } from "path";
 
 export class TaskManager {
@@ -81,6 +82,58 @@ export class TaskManager {
   }
 
   /**
+   * 3.5 提交 MiniMax-H3-Image 九宫格大图生成任务至云端队列
+   */
+  public async submitGridImageToCloudQueue(projectId: string, sessionName?: string) {
+    const project = await db.query.projects.findFirst({
+      where: eq(projects.id, projectId),
+    });
+
+    if (!project) throw new Error("项目不存在");
+
+    const script = await db.query.scripts.findFirst({
+      where: eq(scripts.projectId, projectId),
+    });
+
+    if (!script) throw new Error("项目未包含分镜剧本数据");
+
+    const session = sessionName || process.env.COLAB_SESSION_NAME || "clipforge_helloworld1234";
+    const driveOutputPath = `${process.env.COLAB_DRIVE_OUTPUT_DIR || "/content/drive/MyDrive/ClipForge/outputs"}/${projectId}_grid_full.png`;
+
+    const prompt = script.externalPrompt || `${project.productName} 3x3 grid commercial keyframes, photorealistic, 9:16 vertical`;
+
+    const [task] = await db.insert(cloudTasks).values({
+      projectId,
+      shotId: 0, // shotId 0 标记为九宫格大图任务
+      sessionName: session,
+      state: "submitted_to_inbox",
+      isLocked: false,
+      driveOutputPath,
+    }).returning();
+
+    // 更新项目状态为 grid_reviewing (生成中/等待审核)
+    await db.update(projects).set({
+      status: "grid_reviewing",
+      updatedAt: new Date(),
+    }).where(eq(projects.id, projectId));
+
+    try {
+      await colabClient.pushTaskToInbox({
+        taskId: task.id,
+        type: "image",
+        prompt,
+        driveOutputPath,
+      });
+      console.log(`[STATE-MACHINE] 九宫格生图任务 ${task.id} 已推入云端 inbox`);
+    } catch (err: any) {
+      console.warn(`[STATE-MACHINE] Colab 离线或写入异常，九宫格生图任务在本地排队: ${err.message}`);
+      await db.update(cloudTasks).set({ state: "waiting_for_cloud" }).where(eq(cloudTasks.id, task.id));
+    }
+
+    return task;
+  }
+
+  /**
    * 4. 提交至 Colab 视频生成队列 (加锁置灰)
    */
   public async submitToCloudQueue(projectId: string, sessionName?: string) {
@@ -156,6 +209,43 @@ export class TaskManager {
       });
 
       if (taskRecord && driveFile) {
+        // A. 若为九宫格大图任务 (shotId === 0)，下载后自动切片并更新状态
+        if (taskRecord.shotId === 0) {
+          const localDestDir = join(process.cwd(), "public", "uploads", taskRecord.projectId);
+          const localGridPath = await colabClient.downloadFile(driveFile, localDestDir);
+
+          const slicesOutputDir = join(localDestDir, "slices");
+          const slices = await slice3x3GridImage(localGridPath, slicesOutputDir);
+
+          const scriptRecord = await db.query.scripts.findFirst({
+            where: eq(scripts.projectId, taskRecord.projectId),
+          });
+
+          if (scriptRecord && scriptRecord.shots) {
+            const updatedShots = scriptRecord.shots.map((shot) => {
+              const matched = slices.find((s) => s.index === shot.id);
+              return {
+                ...shot,
+                keyframePath: matched ? matched.filePath : shot.keyframePath,
+              };
+            });
+
+            await db.update(scripts).set({
+              gridImagePath: localGridPath,
+              shots: updatedShots,
+            }).where(eq(scripts.id, scriptRecord.id));
+          }
+
+          await db.update(projects).set({
+            status: "grid_reviewing",
+            updatedAt: new Date(),
+          }).where(eq(projects.id, taskRecord.projectId));
+
+          console.log(`[STATE-MACHINE] MiniMax-H3-Image 九宫格已自动下载并切分 9 张关键帧，等待人工审核！`);
+          return;
+        }
+
+        // B. 若为分镜短视频任务 (shotId > 0)
         const localDestDir = join(process.cwd(), "public", "outputs", taskRecord.projectId, "clips");
         const localVideoPath = await colabClient.downloadFile(driveFile, localDestDir);
 

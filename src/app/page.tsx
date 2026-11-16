@@ -68,6 +68,7 @@ export default function DashboardPage() {
 
   // 视频与导出
   const [isSubmittingCloud, setIsSubmittingCloud] = useState<boolean>(false);
+  const [isGeneratingCloudGrid, setIsGeneratingCloudGrid] = useState<boolean>(false);
   const [isComposing, setIsComposing] = useState<boolean>(false);
   const [finalVideoUrl, setFinalVideoUrl] = useState<string>("");
   const [promptCopied, setPromptCopied] = useState<boolean>(false);
@@ -100,6 +101,20 @@ export default function DashboardPage() {
 
     return () => clearInterval(timer);
   }, []);
+
+  // 当切换到步骤 3 且已有项目时，自动拉取已生成的九宫格切片
+  useEffect(() => {
+    if (activeStep === 3 && currentProjectId) {
+      fetch(`/api/storyboard/slice?projectId=${currentProjectId}`)
+        .then((res) => res.json())
+        .then((data) => {
+          if (data.frames && data.frames.length > 0) {
+            setSlicedFrames(data.frames);
+          }
+        })
+        .catch(() => {});
+    }
+  }, [activeStep, currentProjectId]);
 
   // 拉取所有视频项目列表
   const fetchProjects = async () => {
@@ -150,6 +165,18 @@ export default function DashboardPage() {
       } else {
         setFinalVideoUrl("");
       }
+
+      // 拉取该项目已有的九宫格切片数据
+      fetch(`/api/storyboard/slice?projectId=${p.id}`)
+        .then((res) => res.json())
+        .then((sliceData) => {
+          if (sliceData.frames && sliceData.frames.length > 0) {
+            setSlicedFrames(sliceData.frames);
+          } else {
+            setSlicedFrames([]);
+          }
+        })
+        .catch(() => {});
 
       // 计算并跳转对应步骤
       if (p.status === "completed") {
@@ -210,6 +237,32 @@ export default function DashboardPage() {
       alert(`开机失败: ${err.message}`);
     } finally {
       setIsPoweringOn(false);
+    }
+  };
+
+  // MiniMax-H3-Image 云端一键生成九宫格
+  const handleGenerateCloudGrid = async () => {
+    if (!currentProjectId) {
+      alert("请先生成分镜脚本！");
+      return;
+    }
+    setIsGeneratingCloudGrid(true);
+    try {
+      const res = await fetch("/api/storyboard/cloud-generate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId: currentProjectId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+
+      alert(data.message || "任务已提交云端队列！Colab 就绪后将自动生成并切片。");
+      setActiveStep(3);
+      fetchProjects();
+    } catch (err: any) {
+      alert(`云端九宫格生图失败: ${err.message}`);
+    } finally {
+      setIsGeneratingCloudGrid(false);
     }
   };
 
@@ -674,7 +727,7 @@ export default function DashboardPage() {
                     </div>
                   </div>
 
-                  <div className="flex gap-3">
+                  <div className="flex items-center gap-3">
                     <button
                       onClick={() => {
                         navigator.clipboard.writeText(scriptData.prompts?.googleFlow || "");
@@ -686,9 +739,28 @@ export default function DashboardPage() {
                       <Copy className="w-3.5 h-3.5" />
                       {promptCopied ? "已复制 Flow 提示词" : "复制 Google Flow 九宫格提示词"}
                     </button>
+
+                    <button
+                      disabled={isGeneratingCloudGrid}
+                      onClick={handleGenerateCloudGrid}
+                      className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-bold flex items-center gap-1.5 transition shadow-sm cursor-pointer disabled:opacity-50"
+                    >
+                      {isGeneratingCloudGrid ? (
+                        <>
+                          <RotateCcw className="w-3.5 h-3.5 animate-spin" />
+                          下发云端队列中...
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-3.5 h-3.5 text-amber-300" />
+                          MiniMax-H3-Image 自动生图
+                        </>
+                      )}
+                    </button>
+
                     <button
                       onClick={() => setActiveStep(3)}
-                      className="px-5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold flex items-center gap-1.5 transition"
+                      className="px-5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold flex items-center gap-1.5 transition cursor-pointer"
                     >
                       前往九宫格审核台
                       <ArrowRight className="w-3.5 h-3.5" />
@@ -781,25 +853,40 @@ export default function DashboardPage() {
                   </div>
                 </div>
 
-                {/* 9:16 切片网格展示 */}
+                {/* 9:16 切片网格展示 (真实 3x3 九宫格布局) */}
                 {slicedFrames.length > 0 ? (
-                  <div className="grid grid-cols-3 md:grid-cols-5 gap-4">
-                    {slicedFrames.slice(0, 5).map((frame) => (
-                      <div
-                        key={frame.index}
-                        className="aspect-[9/16] bg-zinc-900 rounded-xl overflow-hidden border border-zinc-800 relative group"
-                      >
-                        <img src={frame.url} alt={`切片 ${frame.index}`} className="w-full h-full object-cover" />
-                        <div className="absolute top-2 left-2 bg-black/60 backdrop-blur px-2 py-0.5 rounded text-[10px] font-bold text-zinc-200">
-                          镜头 #{frame.index}
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between text-xs text-zinc-400">
+                      <span>已就绪 {slicedFrames.length} 张 9:16 等比分镜切片（点击或人工核验无误后请点击右上角确认）</span>
+                    </div>
+                    <div className="grid grid-cols-3 gap-4 max-w-3xl mx-auto">
+                      {slicedFrames.map((frame) => (
+                        <div
+                          key={frame.index}
+                          className="aspect-[9/16] bg-zinc-900 rounded-xl overflow-hidden border border-zinc-800 relative group shadow-lg hover:border-emerald-500/60 transition"
+                        >
+                          <img
+                            src={frame.url}
+                            alt={`分镜切片 #${frame.index}`}
+                            className="w-full h-full object-cover"
+                            onError={(e) => {
+                              console.warn(`图片加载降级处理: 分镜 #${frame.index}`);
+                            }}
+                          />
+                          <div className="absolute top-2 left-2 bg-black/75 backdrop-blur px-2.5 py-0.5 rounded text-[11px] font-bold text-zinc-200 flex items-center gap-1 shadow">
+                            <Eye className="w-3 h-3 text-emerald-400" />
+                            镜头 #{frame.index}
+                          </div>
                         </div>
-                      </div>
-                    ))}
+                      ))}
+                    </div>
                   </div>
                 ) : (
                   <div className="border-2 border-dashed border-zinc-800 rounded-2xl p-16 text-center space-y-3">
                     <Layers className="w-10 h-10 text-zinc-600 mx-auto" />
-                    <p className="text-xs text-zinc-400">暂无切片数据，请点击右上角上传 3x3 九宫格图片</p>
+                    <p className="text-xs text-zinc-400">
+                      暂无切片数据，请在步骤 2 点击「MiniMax-H3-Image 自动生图」或在右上角手动上传 3x3 九宫格原图
+                    </p>
                   </div>
                 )}
               </div>
