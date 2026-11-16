@@ -11,7 +11,7 @@ export const projects = sqliteTable("projects", {
   productImages: text("product_images", { mode: "json" }).$type<string[]>().default([]),
   sellingPoints: text("selling_points", { mode: "json" }).$type<string[]>().default([]),
   status: text("status", {
-    enum: ["draft", "scripting", "grid_reviewing", "grid_approved", "cloud_queued", "cloud_running", "composing", "completed"]
+    enum: ["draft", "scripting", "grid_generating", "grid_reviewing", "grid_approved", "cloud_queued", "cloud_running", "clips_ready", "composing", "completed"]
   }).notNull().default("draft"),
   selectedGeminiModel: text("selected_gemini_model").default("gemini-3.8-flash"),
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
@@ -38,6 +38,7 @@ export const scripts = sqliteTable("scripts", {
   shots: text("shots", { mode: "json" }).$type<Shot[]>().default([]),
   judgeReport: text("judge_report", { mode: "json" }), // 五判官审查与重写报告
   gridImagePath: text("grid_image_path"),              // 3x3 九宫格整图路径
+  referenceImages: text("reference_images", { mode: "json" }).$type<string[]>().default([]), // 商品参考图
   externalPrompt: text("external_prompt"),             // 适配 Google Flow / Midjourney 的提示词
   createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(() => new Date()),
 });

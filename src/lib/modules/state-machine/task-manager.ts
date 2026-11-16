@@ -14,6 +14,13 @@ export class TaskManager {
         await this.onCloudTaskCompleted(payload.task_id, payload.drive_file || "");
       }
     });
+
+    // 监听云端任务流式执行进度通知
+    colabClient.on("task_progress", (payload: { task_id?: string; type?: string; percent?: number; step?: string; message?: string }) => {
+      if (payload && payload.task_id) {
+        console.log(`[STATE-MACHINE] 任务 ${payload.task_id} 进度: ${payload.percent}% (${payload.step}) - ${payload.message}`);
+      }
+    });
   }
   /**
    * 1. 创建项目草稿
@@ -85,7 +92,7 @@ export class TaskManager {
   /**
    * 3.5 提交 MiniMax-H3-Image 九宫格大图生成任务至云端队列
    */
-  public async submitGridImageToCloudQueue(projectId: string, sessionName?: string) {
+  public async submitGridImageToCloudQueue(projectId: string, sessionName?: string, referenceImages?: string[]) {
     const project = await db.query.projects.findFirst({
       where: eq(projects.id, projectId),
     });
@@ -97,6 +104,22 @@ export class TaskManager {
     });
 
     if (!script) throw new Error("项目未包含分镜剧本数据");
+
+    // 门禁拦截：检查参考图
+    const effectiveRefImages = (referenceImages && referenceImages.length > 0)
+      ? referenceImages
+      : (script.referenceImages && Array.isArray(script.referenceImages) ? script.referenceImages : []);
+
+    if (effectiveRefImages.length === 0) {
+      throw new Error("门禁拦截：尚未添加任何商品参考图！MiniMax-H3-Image 生成九宫格必须提供参考图。");
+    }
+
+    // 若上传了参考图，持久化记录到 scripts
+    if (referenceImages && referenceImages.length > 0) {
+      await db.update(scripts).set({
+        referenceImages,
+      }).where(eq(scripts.id, script.id));
+    }
 
     const session = sessionName || process.env.COLAB_SESSION_NAME || "clipforge_helloworld1234";
     const driveOutputPath = `${process.env.COLAB_DRIVE_OUTPUT_DIR || "/content/drive/MyDrive/ClipForge/outputs"}/${projectId}_grid_full.png`;
@@ -112,9 +135,9 @@ export class TaskManager {
       driveOutputPath,
     }).returning();
 
-    // 更新项目状态为 grid_reviewing (生成中/等待审核)
+    // 更新项目状态为 grid_generating (云端极速生成中)
     await db.update(projects).set({
-      status: "grid_reviewing",
+      status: "grid_generating",
       updatedAt: new Date(),
     }).where(eq(projects.id, projectId));
 
@@ -123,9 +146,11 @@ export class TaskManager {
         taskId: task.id,
         type: "image",
         prompt,
+        refImages: referenceImages,
+        shots: script.shots || [],
         driveOutputPath,
       });
-      console.log(`[STATE-MACHINE] 九宫格生图任务 ${task.id} 已推入云端 inbox`);
+      console.log(`[STATE-MACHINE] 九宫格生图任务 ${task.id} (带 ${referenceImages?.length || 0} 张参考图) 已推入云端 inbox`);
     } catch (err: any) {
       console.warn(`[STATE-MACHINE] Colab 离线或写入异常，九宫格生图任务在本地排队: ${err.message}`);
       await db.update(cloudTasks).set({ state: "waiting_for_cloud" }).where(eq(cloudTasks.id, task.id));
@@ -146,6 +171,7 @@ export class TaskManager {
     if (
       project.status !== "grid_approved" &&
       project.status !== "cloud_running" &&
+      project.status !== "clips_ready" &&
       project.status !== "completed"
     ) {
       throw new Error("门禁拦截：九宫格关键帧尚未通过人工审核，禁止提交云端任务！");
@@ -271,10 +297,16 @@ export class TaskManager {
             }).where(eq(scripts.id, scriptRecord.id));
           }
 
-          await db.update(projects).set({
-            status: "grid_reviewing",
-            updatedAt: new Date(),
-          }).where(eq(projects.id, taskRecord.projectId));
+          // ⚠️ 防状态覆盖：仅在项目仍处于 grid_generating 时跃迁为 grid_reviewing
+          const curProject = await db.query.projects.findFirst({
+            where: eq(projects.id, taskRecord.projectId),
+          });
+          if (curProject && curProject.status === "grid_generating") {
+            await db.update(projects).set({
+              status: "grid_reviewing",
+              updatedAt: new Date(),
+            }).where(eq(projects.id, taskRecord.projectId));
+          }
 
           console.log(`[STATE-MACHINE] MiniMax-H3-Image 九宫格已自动下载并切分 9 张关键帧，等待人工审核！`);
           return;
@@ -306,6 +338,16 @@ export class TaskManager {
           }).where(eq(scripts.id, scriptRecord.id));
 
           console.log(`[STATE-MACHINE] 分镜 ${taskRecord.shotId} 视频已成功下载并挂载至本地: ${localVideoPath}`);
+
+          // 检查是否全部分镜视频皆已就绪
+          const allShotsDone = updatedShots.length > 0 && updatedShots.every((s) => s.status === "done" && s.videoPath);
+          if (allShotsDone) {
+            await db.update(projects).set({
+              status: "clips_ready",
+              updatedAt: new Date(),
+            }).where(eq(projects.id, taskRecord.projectId));
+            console.log(`[STATE-MACHINE] 🎉 项目 ${taskRecord.projectId} 的 ${updatedShots.length} 个分镜视频已全部就绪！状态跃迁为 clips_ready。`);
+          }
         }
       }
     } catch (downloadErr) {

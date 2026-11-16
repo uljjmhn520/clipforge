@@ -19,30 +19,155 @@ from typing import Optional, Dict, Any
 
 # 全局状态管理
 STATE = {
-    "status": "IDLE",  # "IDLE" 或 "BUSY"
+    "status": "INIT",  # "INIT", "IDLE" 或 "BUSY"
     "current_task_id": None,
     "last_inbox_line": 0,
     "idle_timeout_seconds": 300,  # 默认 5 分钟
     "idle_seconds_left": 300,
     "max_lifetime_seconds": 10800,  # 默认 3 小时硬上限
     "started_at": time.time(),
+    "env_ready": False,
     "lock": threading.Lock()
 }
 
 INBOX_PATH = "/content/inbox.jsonl"
 OUTBOX_PATH = "/content/outbox.jsonl"
 
-def get_gpu_memory_info():
-    """获取当前 GPU 显存使用情况 (MB)"""
+def send_rpc_event(method: str, params: Dict[str, Any]):
+    """向标准输出投递异步通知事件 (JSON-RPC Notification)"""
+    event = {
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params
+    }
+    try:
+        sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+def get_cpu_percent() -> float:
+    """获取 CPU 使用率百分比"""
+    try:
+        import psutil
+        return float(psutil.cpu_percent(interval=None))
+    except Exception:
+        pass
+    try:
+        with open("/proc/stat", "r") as f:
+            fields = [float(column) for column in f.readline().strip().split()[1:5]]
+        idle, total = fields[3], sum(fields)
+        return round(100.0 * (1.0 - idle / (total if total > 0 else 1)), 1)
+    except Exception:
+        return 0.0
+
+def get_ram_info() -> Dict[str, Any]:
+    """获取系统内存使用情况 (MB 与百分比)"""
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        return {
+            "usedMb": int(vm.used // (1024 * 1024)),
+            "totalMb": int(vm.total // (1024 * 1024)),
+            "percent": round(vm.percent, 1)
+        }
+    except Exception:
+        pass
+    try:
+        mem = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    mem[parts[0].strip()] = int(parts[1].strip().split()[0])
+        total_kb = mem.get("MemTotal", 0)
+        avail_kb = mem.get("MemAvailable", mem.get("MemFree", 0))
+        used_kb = total_kb - avail_kb
+        total_mb = total_kb // 1024
+        used_mb = used_kb // 1024
+        percent = round(100.0 * used_kb / (total_kb if total_kb > 0 else 1), 1)
+        return {"usedMb": used_mb, "totalMb": total_mb, "percent": percent}
+    except Exception:
+        return {"usedMb": 0, "totalMb": 0, "percent": 0.0}
+
+def get_gpu_info() -> Dict[str, Any]:
+    """获取 GPU 硬件型号、计算利用率与显存情况"""
+    try:
+        import subprocess
+        cmd = ["nvidia-smi", "--query-gpu=name,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]
+        out = subprocess.check_output(cmd, timeout=3).decode("utf-8").strip()
+        if out:
+            parts = [p.strip() for p in out.split(",")]
+            name = parts[0]
+            util_pct = float(parts[1]) if len(parts) > 1 else 0.0
+            used_mb = int(parts[2]) if len(parts) > 2 else 0
+            total_mb = int(parts[3]) if len(parts) > 3 else 0
+            vram_pct = round(100.0 * used_mb / (total_mb if total_mb > 0 else 1), 1)
+            return {
+                "name": name,
+                "utilizationPercent": util_pct,
+                "memoryUsedMb": used_mb,
+                "memoryTotalMb": total_mb,
+                "memoryPercent": vram_pct
+            }
+    except Exception:
+        pass
     try:
         import torch
         if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
             used = torch.cuda.memory_allocated(0) // (1024 * 1024)
             total = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
-            return int(used), int(total)
+            pct = round(100.0 * used / (total if total > 0 else 1), 1)
+            return {
+                "name": name,
+                "utilizationPercent": 0.0,
+                "memoryUsedMb": int(used),
+                "memoryTotalMb": int(total),
+                "memoryPercent": pct
+            }
     except Exception:
         pass
-    return 0, 0
+    return {
+        "name": "N/A",
+        "utilizationPercent": 0.0,
+        "memoryUsedMb": 0,
+        "memoryTotalMb": 0,
+        "memoryPercent": 0.0
+    }
+
+def async_bootstrap_sequence():
+    """开机阶段二：受控流式环境就绪调度"""
+    time.sleep(0.5)
+    # 1. 建立双向通信通道
+    send_rpc_event("env.progress", {"step": "handshake", "status": "completed", "message": "双向通信管道建立完毕"})
+
+    # 2. 挂载 Google Drive
+    send_rpc_event("env.progress", {"step": "drive", "status": "running", "message": "正在挂载 Google Drive 持久化目录..."})
+    try:
+        from google.colab import drive
+        drive.mount('/content/drive')
+        os.makedirs("/content/drive/MyDrive/ClipForge/outputs", exist_ok=True)
+        send_rpc_event("env.progress", {"step": "drive", "status": "completed", "message": "Google Drive 挂载完成"})
+    except Exception as e:
+        os.makedirs("/content/outputs", exist_ok=True)
+        send_rpc_event("env.progress", {"step": "drive", "status": "completed", "message": "本地模拟目录就绪"})
+
+    # 3. 硬件算力与 GPU 检测
+    send_rpc_event("env.progress", {"step": "gpu", "status": "running", "message": "正在检测 GPU 硬件规格..."})
+    gpu_info = get_gpu_info()
+    send_rpc_event("env.progress", {
+        "step": "gpu",
+        "status": "completed",
+        "message": f"{gpu_info['name']} ({gpu_info['memoryTotalMb']}MB 显存) 就绪",
+        "gpu": gpu_info
+    })
+
+    # 4. 全部就绪，跃迁至 IDLE 状态
+    with STATE["lock"]:
+        STATE["env_ready"] = True
+        STATE["status"] = "IDLE"
+    send_rpc_event("env.progress", {"step": "ready", "status": "completed", "message": "云端算力节点已完全就绪，等待下发任务"})
 
 def idle_watchdog_thread():
     """阶段 2 动态看门狗守护循环"""
@@ -57,8 +182,8 @@ def idle_watchdog_thread():
             shutdown_colab()
 
         with STATE["lock"]:
-            if STATE["status"] == "BUSY":
-                # 忙时彻底冻结倒计时，每次重置为初始阈值
+            if STATE["status"] == "BUSY" or STATE["status"] == "INIT":
+                # 忙时或初始化中冻结倒计时
                 STATE["idle_seconds_left"] = STATE["idle_timeout_seconds"]
             else:
                 # 闲时倒计时
@@ -89,7 +214,9 @@ def handle_stdin_rpc():
             msg_id = req.get("id")
 
             if method == "heartbeat.ping":
-                used_mb, total_mb = get_gpu_memory_info()
+                cpu_pct = get_cpu_percent()
+                ram_info = get_ram_info()
+                gpu_info = get_gpu_info()
                 with STATE["lock"]:
                     resp = {
                         "jsonrpc": "2.0",
@@ -99,9 +226,14 @@ def handle_stdin_rpc():
                             "state": STATE["status"],
                             "current_task_id": STATE["current_task_id"],
                             "last_processed_line": STATE["last_inbox_line"],
-                            "gpu_memory_used_mb": used_mb,
-                            "gpu_memory_total_mb": total_mb,
-                            "idle_seconds_left": STATE["idle_seconds_left"]
+                            "idle_seconds_left": STATE["idle_seconds_left"],
+                            "cpu": {
+                                "percent": cpu_pct
+                            },
+                            "ram": ram_info,
+                            "gpu": gpu_info,
+                            "gpu_memory_used_mb": gpu_info["memoryUsedMb"],
+                            "gpu_memory_total_mb": gpu_info["memoryTotalMb"]
                         }
                     }
                 sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
@@ -147,7 +279,20 @@ def process_single_task(task: Dict[str, Any]) -> Dict[str, Any]:
     prompt = task.get("prompt", "")
     drive_output_path = task.get("drive_output_path", f"/content/outputs/{task_id}.mp4")
 
+    def progress_callback(percent: int, step: str, message: str, extra: Optional[dict] = None):
+        payload = {
+            "task_id": task_id,
+            "type": task_type,
+            "percent": percent,
+            "step": step,
+            "message": message
+        }
+        if extra:
+            payload.update(extra)
+        send_rpc_event("task.progress", payload)
+
     print(f"[TASK] 开始处理任务 {task_id} (类型: {task_type})", flush=True)
+    progress_callback(5, "init", f"任务已进入执行管道: {task_id}")
     t0 = time.time()
 
     # 确保存储目录存在
@@ -157,11 +302,13 @@ def process_single_task(task: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from minimax_engine import generate_video_clip, generate_grid_image
         if task_type == "image":
-            generate_grid_image(prompt, drive_output_path)
+            ref_images = task.get("ref_images") or task.get("reference_images") or []
+            shots = task.get("shots")
+            generate_grid_image(prompt, drive_output_path, ref_images, shots, progress_callback)
         else:
             keyframe_b64 = task.get("keyframe_b64")
             duration_sec = task.get("duration_sec", 5)
-            generate_video_clip(prompt, keyframe_b64, duration_sec, drive_output_path)
+            generate_video_clip(prompt, keyframe_b64, duration_sec, drive_output_path, progress_callback)
     except Exception as e:
         print(f"[TASK-SIM] 推理引擎调用 (或模拟回退): {e}", flush=True)
         # 兜底生成标记文件，保证端到端不阻塞
@@ -170,6 +317,7 @@ def process_single_task(task: Dict[str, Any]) -> Dict[str, Any]:
                 f.write(b"MOCK_VIDEO_DATA")
 
     elapsed = round(time.time() - t0, 2)
+    progress_callback(100, "completed", f"任务执行完毕，产物落盘: {elapsed}s")
     return {
         "task_id": task_id,
         "status": "completed",
@@ -238,6 +386,29 @@ def process_file_queue():
         except Exception as e:
             time.sleep(2)
 
+def metrics_reporter_thread():
+    """后台指标上报线程：每 60 秒主动向本地推送 system.metrics 事件 (无需本地频繁轮询)"""
+    while True:
+        time.sleep(60)
+        try:
+            if STATE.get("env_ready"):
+                cpu_pct = get_cpu_percent()
+                ram_info = get_ram_info()
+                gpu_info = get_gpu_info()
+                with STATE["lock"]:
+                    send_rpc_event("system.metrics", {
+                        "state": STATE["status"],
+                        "current_task_id": STATE["current_task_id"],
+                        "idle_seconds_left": STATE["idle_seconds_left"],
+                        "cpu": {"percent": cpu_pct},
+                        "ram": ram_info,
+                        "gpu": gpu_info,
+                        "gpu_memory_used_mb": gpu_info["memoryUsedMb"],
+                        "gpu_memory_total_mb": gpu_info["memoryTotalMb"]
+                    })
+        except Exception:
+            pass
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--idle-timeout", type=int, default=5, help="空闲超时分钟数")
@@ -253,6 +424,14 @@ def main():
     # 启动文件队列消费线程
     t_queue = threading.Thread(target=process_file_queue, daemon=True)
     t_queue.start()
+
+    # 启动开机阶段二：受控流式环境就绪调度线程 (通知本地当前初始化进度)
+    t_boot = threading.Thread(target=async_bootstrap_sequence, daemon=True)
+    t_boot.start()
+
+    # 启动 60 秒定时系统指标主动推送线程
+    t_metrics = threading.Thread(target=metrics_reporter_thread, daemon=True)
+    t_metrics.start()
 
     print("[RUNNER] ClipForge 云端协议运行器已完全就绪！开始监听通信...", flush=True)
 

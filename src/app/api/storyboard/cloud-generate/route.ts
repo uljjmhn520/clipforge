@@ -4,13 +4,13 @@ import { taskManager } from "@/lib/modules/state-machine/task-manager";
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const { projectId, sessionName } = body;
+    const { projectId, sessionName, referenceImages } = body;
 
     if (!projectId) {
       return NextResponse.json({ error: "缺少 projectId 参数" }, { status: 400 });
     }
 
-    const task = await taskManager.submitGridImageToCloudQueue(projectId, sessionName);
+    const task = await taskManager.submitGridImageToCloudQueue(projectId, sessionName, referenceImages);
 
     return NextResponse.json({
       success: true,

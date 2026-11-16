@@ -61,12 +61,18 @@ export async function GET(req: Request) {
         if (p.status === "completed") {
           step = 5;
           stepLabel = "已成片";
+        } else if (p.status === "clips_ready") {
+          step = 4;
+          stepLabel = "分镜视频全部就绪，待本地合成";
         } else if (p.status === "cloud_running" || p.status === "composing") {
           step = 4;
           stepLabel = "云端渲染中 (只读锁定)";
+        } else if (p.status === "grid_generating") {
+          step = 3;
+          stepLabel = "MiniMax-H3 云端生图中";
         } else if (p.status === "grid_approved" || p.status === "cloud_queued") {
           step = 4;
-          stepLabel = "九宫格已审核通过，待合成";
+          stepLabel = "九宫格已审核通过，待下发";
         } else if (p.status === "grid_reviewing") {
           step = 3;
           stepLabel = "待人工审核九宫格";

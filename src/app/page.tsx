@@ -23,6 +23,10 @@ import {
   RefreshCw,
   ExternalLink,
   ChevronRight,
+  ChevronDown,
+  Activity,
+  X,
+  Image as ImageIcon,
   Eye,
   Lock,
   Trash2,
@@ -38,6 +42,7 @@ export default function DashboardPage() {
   const [selectedModel, setSelectedModel] = useState<string>("gemini-3.5-flash");
   const [colabGpu, setColabGpu] = useState<string>("L4");
   const [isPoweringOn, setIsPoweringOn] = useState<boolean>(false);
+  const [showMetricsPopover, setShowMetricsPopover] = useState<boolean>(false);
   const [colabStatus, setColabStatus] = useState<any>({
     online: false,
     state: "OFFLINE",
@@ -56,6 +61,7 @@ export default function DashboardPage() {
     "0脂0糖低卡，3秒即溶，还原现磨星巴克美式风味，熬夜早八打工人续命神器，性价比超高"
   );
   const [productImageBase64, setProductImageBase64] = useState<string>("");
+  const [referenceImages, setReferenceImages] = useState<string[]>([]);
 
   // 生成状态
   const [isGeneratingScript, setIsGeneratingScript] = useState<boolean>(false);
@@ -78,6 +84,9 @@ export default function DashboardPage() {
   // 全部项目进度列表
   const [projectList, setProjectList] = useState<any[]>([]);
   const [isLoadingProjects, setIsLoadingProjects] = useState<boolean>(false);
+
+  const currentProject = projectList.find((p) => p.id === currentProjectId);
+  const isGridGenerating = currentProject?.status === "grid_generating" || isGeneratingCloudGrid;
 
   // 1. 初始化拉取可用模型与启动 Colab 状态轮询
   useEffect(() => {
@@ -104,19 +113,94 @@ export default function DashboardPage() {
     return () => clearInterval(timer);
   }, []);
 
-  // 当切换到步骤 3 且已有项目时，自动拉取已生成的九宫格切片
+  // 当切换到步骤 3 且已有项目时，自动拉取已生成的九宫格切片并支持云端轮询自愈
   useEffect(() => {
     if (activeStep === 3 && currentProjectId) {
-      fetch(`/api/storyboard/slice?projectId=${currentProjectId}`)
-        .then((res) => res.json())
-        .then((data) => {
-          if (data.frames && data.frames.length > 0) {
-            setSlicedFrames(data.frames);
+      const loadSlices = () => {
+        fetch(`/api/storyboard/slice?projectId=${currentProjectId}`)
+          .then((res) => res.json())
+          .then((data) => {
+            if (data.frames && data.frames.length > 0) {
+              setSlicedFrames(data.frames);
+            }
+          })
+          .catch(() => {});
+      };
+
+      loadSlices();
+
+      // 定期探测项目状态，若云端生图中 (grid_generating)，每 3 秒检测一次切片并刷新
+      const pollTimer = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/projects?id=${currentProjectId}`);
+          const data = await res.json();
+          if (data.project?.status && data.project.status !== "grid_generating") {
+            loadSlices();
+            fetchProjects();
           }
-        })
-        .catch(() => {});
+        } catch (_) {}
+      }, 3000);
+
+      return () => clearInterval(pollTimer);
     }
   }, [activeStep, currentProjectId]);
+
+  // 当处于步骤 4 且已有项目时，每 3 秒检测分镜视频片段下载状态与最终成片
+  useEffect(() => {
+    if (activeStep === 4 && currentProjectId) {
+      const pollTimer = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/projects?id=${currentProjectId}`);
+          const data = await res.json();
+          if (data.project) {
+            if (data.script?.shots) {
+              setScriptData((prev: any) => ({
+                ...(prev || {}),
+                ...data.script,
+              }));
+            }
+            if (data.composition?.outputPath) {
+              const url = data.composition.outputPath.startsWith("public/")
+                ? data.composition.outputPath.slice(6)
+                : data.composition.outputPath.startsWith("/public/")
+                ? data.composition.outputPath.slice(7)
+                : data.composition.outputPath;
+              setFinalVideoUrl(url.startsWith("/") ? url : `/${url}`);
+            }
+            fetchProjects();
+          }
+        } catch (_) {}
+      }, 3000);
+
+      return () => clearInterval(pollTimer);
+    }
+  }, [activeStep, currentProjectId]);
+
+  // 商品参考图上传与删除辅助函数
+  const handleAddReferenceImage = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+    Array.from(files).forEach((file) => {
+      if (referenceImages.length >= 3) {
+        alert("最多支持上传 3 张商品参考图！");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === "string") {
+          setReferenceImages((prev) => {
+            if (prev.length >= 3) return prev;
+            return [...prev, reader.result as string];
+          });
+        }
+      };
+      reader.readAsDataURL(file);
+    });
+  };
+
+  const handleRemoveReferenceImage = (index: number) => {
+    setReferenceImages((prev) => prev.filter((_, i) => i !== index));
+  };
 
   // 拉取所有视频项目列表
   const fetchProjects = async () => {
@@ -158,8 +242,14 @@ export default function DashboardPage() {
             midjourney: data.script.externalPrompt,
           },
         });
+        if (data.script.referenceImages && Array.isArray(data.script.referenceImages)) {
+          setReferenceImages(data.script.referenceImages);
+        } else {
+          setReferenceImages([]);
+        }
       } else {
         setScriptData(null);
+        setReferenceImages([]);
       }
 
       if (data.composition) {
@@ -184,13 +274,13 @@ export default function DashboardPage() {
       if (p.status === "completed") {
         setActiveStep(4);
         setIsGridApproved(true);
-      } else if (p.status === "cloud_running") {
+      } else if (p.status === "clips_ready" || p.status === "cloud_running") {
         setActiveStep(4);
         setIsGridApproved(true);
       } else if (p.status === "grid_approved") {
         setActiveStep(4);
         setIsGridApproved(true);
-      } else if (p.status === "grid_reviewing" || p.status === "grid_review") {
+      } else if (p.status === "grid_generating" || p.status === "grid_reviewing" || p.status === "grid_review") {
         setActiveStep(3);
         setIsGridApproved(false);
       } else if (data.script) {
@@ -215,6 +305,7 @@ export default function DashboardPage() {
     setPrice("¥99");
     setDescription("");
     setProductImageBase64("");
+    setReferenceImages([]);
     setScriptData(null);
     setGridImageBase64("");
     setSlicedFrames([]);
@@ -350,18 +441,45 @@ export default function DashboardPage() {
     }
   };
 
-  // MiniMax-H3-Image 云端一键生成九宫格
+  // MiniMax-H3-Image 云端一键生成九宫格 (带强校验与自动复用)
   const handleGenerateCloudGrid = async () => {
     if (!currentProjectId) {
       alert("请先生成分镜脚本！");
       return;
     }
+
+    // 检查参考图：若步骤 2 未添加，自动尝试复用步骤 1 的商品主图
+    let finalRefImages = [...referenceImages];
+    if (finalRefImages.length === 0 && productImageBase64) {
+      finalRefImages = [productImageBase64];
+      setReferenceImages([productImageBase64]);
+    }
+
+    // 强校验阻断：两处均无任何图片时，弹出明确提示并高亮定位
+    if (finalRefImages.length === 0) {
+      alert(
+        "⚠️ 门禁拦截：尚未添加任何商品参考图！\n\n请在下方「商品视觉参考图」区域至少添加 1 张商品白底图或细节实拍，以便 MiniMax-H3 模型精准还原商品外观。"
+      );
+      const refEl = document.getElementById("reference-images-section");
+      if (refEl) {
+        refEl.scrollIntoView({ behavior: "smooth", block: "center" });
+        refEl.classList.add("ring-2", "ring-rose-500", "animate-pulse");
+        setTimeout(() => {
+          refEl.classList.remove("ring-2", "ring-rose-500", "animate-pulse");
+        }, 3000);
+      }
+      return;
+    }
+
     setIsGeneratingCloudGrid(true);
     try {
       const res = await fetch("/api/storyboard/cloud-generate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ projectId: currentProjectId }),
+        body: JSON.stringify({
+          projectId: currentProjectId,
+          referenceImages: finalRefImages,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
@@ -606,21 +724,128 @@ export default function DashboardPage() {
             </select>
           </div>
 
-          {/* Colab 专属 Session 状态与开机面板 */}
-          <div className="flex items-center gap-3 bg-zinc-800/80 px-3.5 py-1.5 rounded-lg border border-zinc-700/60 text-xs">
-            <div className="flex items-center gap-1.5">
-              <span
-                className={`w-2 h-2 rounded-full ${
-                  colabStatus.online ? "bg-emerald-400 animate-pulse" : "bg-zinc-500"
-                }`}
-              />
-              <span className="text-zinc-300 font-medium">
-                {colabStatus.online ? "Colab L4 就绪" : "Colab 离线"}
+          {/* Colab 专属 Session 状态、系统资源监控与开机面板 */}
+          {(isPoweringOn || colabStatus.isPoweringOn) ? (
+            <div className="flex items-center gap-2 bg-amber-500/10 px-3.5 py-1.5 rounded-lg border border-amber-500/30 text-xs text-amber-300 shadow-sm">
+              <RotateCcw className="w-3.5 h-3.5 animate-spin text-amber-400" />
+              <span className="font-medium">
+                {colabStatus.lastInitStep || "实例正在启动并初始化双向通信协议..."}
               </span>
             </div>
+          ) : colabStatus.online ? (
+            <div className="relative">
+              <button
+                onClick={() => setShowMetricsPopover(!showMetricsPopover)}
+                className="flex items-center gap-2.5 bg-zinc-800/90 hover:bg-zinc-700/80 px-3.5 py-1.5 rounded-lg border border-emerald-500/30 text-xs transition cursor-pointer shadow-sm"
+              >
+                <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse shrink-0" />
+                <span className="text-emerald-400 font-bold">
+                  在线 ({colabStatus.metrics?.gpu?.name ? colabStatus.metrics.gpu.name.replace("NVIDIA ", "") : "L4"})
+                </span>
+                <span className="text-zinc-600">|</span>
+                <span className="text-zinc-300 font-medium">
+                  CPU: <strong className="text-white font-mono">{colabStatus.metrics?.cpu?.percent ?? 0}%</strong>
+                </span>
+                <span className="text-zinc-600">|</span>
+                <span className="text-zinc-300 font-medium">
+                  内存: <strong className="text-white font-mono">{((colabStatus.metrics?.ram?.usedMb ?? 0) / 1024).toFixed(1)}</strong>/{((colabStatus.metrics?.ram?.totalMb ?? 0) / 1024).toFixed(1)}G
+                </span>
+                <span className="text-zinc-600">|</span>
+                <span className="text-cyan-300 font-medium">
+                  显存: <strong className="text-white font-mono">{((colabStatus.gpuMemoryUsedMb || 0) / 1024).toFixed(1)}</strong>/{((colabStatus.gpuMemoryTotalMb || 0) / 1024).toFixed(1)}G
+                </span>
+                <ChevronDown className={`w-3.5 h-3.5 text-zinc-400 transition-transform ${showMetricsPopover ? "rotate-180" : ""}`} />
+              </button>
 
-            {/* ⚡ 离线时的一键开机按钮与 GPU 选择 */}
-            {!colabStatus.online && (
+              {/* 展开浮层：Colab 系统级硬件资源仪表盘 */}
+              {showMetricsPopover && (
+                <div className="absolute right-0 top-full mt-2 w-84 bg-zinc-900/95 backdrop-blur-md border border-zinc-700 rounded-xl p-4 shadow-2xl z-50 space-y-3.5">
+                  <div className="flex items-center justify-between pb-2 border-b border-zinc-800">
+                    <span className="text-xs font-bold text-zinc-200 flex items-center gap-1.5">
+                      <Activity className="w-4 h-4 text-emerald-400" />
+                      Colab 实时系统硬件监控
+                    </span>
+                    <span className="text-[10px] text-zinc-400 font-mono">
+                      {colabStatus.sessionName || "clipforge_helloworld1234"}
+                    </span>
+                  </div>
+
+                  {/* CPU 负载 */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[11px]">
+                      <span className="text-zinc-400">CPU 使用率</span>
+                      <span className="text-zinc-200 font-bold font-mono">{colabStatus.metrics?.cpu?.percent ?? 0}%</span>
+                    </div>
+                    <div className="w-full bg-zinc-800 h-2 rounded-full overflow-hidden">
+                      <div
+                        className="bg-emerald-500 h-full transition-all duration-500"
+                        style={{ width: `${Math.min(100, colabStatus.metrics?.cpu?.percent ?? 0)}%` }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* 系统内存 RAM */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[11px]">
+                      <span className="text-zinc-400">系统内存 (RAM)</span>
+                      <span className="text-zinc-200 font-bold font-mono">
+                        {((colabStatus.metrics?.ram?.usedMb ?? 0) / 1024).toFixed(1)} / {((colabStatus.metrics?.ram?.totalMb ?? 0) / 1024).toFixed(1)} GB ({colabStatus.metrics?.ram?.percent ?? 0}%)
+                      </span>
+                    </div>
+                    <div className="w-full bg-zinc-800 h-2 rounded-full overflow-hidden">
+                      <div
+                        className="bg-cyan-500 h-full transition-all duration-500"
+                        style={{ width: `${Math.min(100, colabStatus.metrics?.ram?.percent ?? 0)}%` }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* GPU 显存 VRAM */}
+                  <div className="space-y-1">
+                    <div className="flex justify-between text-[11px]">
+                      <span className="text-zinc-400">{colabStatus.metrics?.gpu?.name || "NVIDIA L4"} 显存 (VRAM)</span>
+                      <span className="text-amber-400 font-bold font-mono">
+                        {((colabStatus.gpuMemoryUsedMb || 0) / 1024).toFixed(1)} / {((colabStatus.gpuMemoryTotalMb || 0) / 1024).toFixed(1)} GB
+                      </span>
+                    </div>
+                    <div className="w-full bg-zinc-800 h-2 rounded-full overflow-hidden">
+                      <div
+                        className="bg-amber-500 h-full transition-all duration-500"
+                        style={{ width: `${Math.min(100, ((colabStatus.gpuMemoryUsedMb || 0) / (colabStatus.gpuMemoryTotalMb || 1)) * 100)}%` }}
+                      />
+                    </div>
+                  </div>
+
+                  {/* 状态与控制 */}
+                  <div className="pt-2 border-t border-zinc-800 flex items-center justify-between text-xs">
+                    <span className="text-zinc-400 flex items-center gap-1 text-[11px]">
+                      <Clock className="w-3.5 h-3.5 text-amber-400" />
+                      空闲释放倒计时: <strong className="text-amber-300 font-mono">{colabStatus.idleSecondsLeft > 0 ? `${colabStatus.idleSecondsLeft}s` : "BUSY"}</strong>
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={handleKeepAlive}
+                        className="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-[11px] transition cursor-pointer"
+                      >
+                        续命 15m
+                      </button>
+                      <button
+                        onClick={handleTerminateColab}
+                        className="px-2 py-1 rounded bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 text-[11px] transition cursor-pointer"
+                      >
+                        释放停机
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="flex items-center gap-3 bg-zinc-800/80 px-3.5 py-1.5 rounded-lg border border-zinc-700/60 text-xs">
+              <div className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-zinc-500" />
+                <span className="text-zinc-300 font-medium">Colab 离线</span>
+              </div>
               <div className="flex items-center gap-2">
                 <select
                   value={colabGpu}
@@ -633,42 +858,14 @@ export default function DashboardPage() {
                 <button
                   onClick={handlePowerOnColab}
                   disabled={isPoweringOn}
-                  className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-[11px] flex items-center gap-1 transition shadow-sm cursor-pointer"
+                  className="px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-[11px] flex items-center gap-1 transition shadow-sm cursor-pointer disabled:opacity-50"
                 >
                   <Power className="w-3 h-3" />
                   {isPoweringOn ? "开机中..." : "一键开机 (colab new)"}
                 </button>
               </div>
-            )}
-
-            {colabStatus.online && (
-              <>
-                <div className="h-3 w-px bg-zinc-700" />
-                <span className="text-zinc-400 flex items-center gap-1">
-                  <HardDrive className="w-3 h-3 text-cyan-400" />
-                  {colabStatus.gpuMemoryUsedMb}/{colabStatus.gpuMemoryTotalMb}MB
-                </span>
-                <div className="h-3 w-px bg-zinc-700" />
-                <span className="text-amber-400 flex items-center gap-1 font-mono">
-                  <Clock className="w-3 h-3" />
-                  {colabStatus.idleSecondsLeft > 0 ? `${colabStatus.idleSecondsLeft}s` : "BUSY"}
-                </span>
-                <button
-                  onClick={handleKeepAlive}
-                  className="px-2 py-0.5 rounded bg-zinc-700 hover:bg-zinc-600 text-zinc-200 text-[11px] transition"
-                >
-                  续命 15m
-                </button>
-                <button
-                  onClick={handleTerminateColab}
-                  className="p-1 rounded hover:bg-rose-500/20 text-rose-400 transition"
-                  title="立即停机"
-                >
-                  <Power className="w-3.5 h-3.5" />
-                </button>
-              </>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       </header>
 
@@ -772,6 +969,59 @@ export default function DashboardPage() {
                       className="w-full bg-zinc-800/80 border border-zinc-700/80 rounded-xl px-4 py-2.5 text-sm text-zinc-100 outline-none focus:border-emerald-500 transition leading-relaxed"
                       placeholder="详细说明痛点场景与实测亮点..."
                     />
+                  </div>
+
+                  {/* 商品主图上传 (可选，生图时自动复用) */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs font-semibold text-zinc-300 flex items-center gap-1.5">
+                        <ImageIcon className="w-3.5 h-3.5 text-emerald-400" />
+                        商品主图 (可选上传，生图时自动复用)
+                      </label>
+                      {productImageBase64 && (
+                        <button
+                          type="button"
+                          onClick={() => setProductImageBase64("")}
+                          className="text-[11px] text-rose-400 hover:text-rose-300 transition"
+                        >
+                          移除主图
+                        </button>
+                      )}
+                    </div>
+                    {productImageBase64 ? (
+                      <div className="relative w-24 h-24 rounded-xl overflow-hidden border border-zinc-700 group bg-zinc-800">
+                        <img src={productImageBase64} alt="商品主图" className="w-full h-full object-cover" />
+                        <button
+                          type="button"
+                          onClick={() => setProductImageBase64("")}
+                          className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center transition text-rose-400"
+                        >
+                          <X className="w-5 h-5" />
+                        </button>
+                      </div>
+                    ) : (
+                      <label className="border-2 border-dashed border-zinc-700/80 hover:border-emerald-500/60 rounded-xl p-3 flex items-center justify-center gap-2 cursor-pointer transition text-zinc-400 hover:text-zinc-200 text-xs bg-zinc-800/40">
+                        <Upload className="w-4 h-4 text-emerald-400" />
+                        <span>点击上传商品白底/主图 (JPG/PNG/WEBP)</span>
+                        <input
+                          type="file"
+                          accept="image/*"
+                          className="hidden"
+                          onChange={(e) => {
+                            const file = e.target.files?.[0];
+                            if (file) {
+                              const reader = new FileReader();
+                              reader.onload = () => {
+                                if (typeof reader.result === "string") {
+                                  setProductImageBase64(reader.result);
+                                }
+                              };
+                              reader.readAsDataURL(file);
+                            }
+                          }}
+                        />
+                      </label>
+                    )}
                   </div>
 
                   <button
@@ -904,6 +1154,69 @@ export default function DashboardPage() {
                   </div>
                 )}
 
+                {/* 商品视觉参考图管理区 (MiniMax-H3 生图必填) */}
+                <div
+                  id="reference-images-section"
+                  className="bg-zinc-900/60 p-4 rounded-xl border border-zinc-800 space-y-3 transition-all duration-300"
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <ImageIcon className="w-4 h-4 text-cyan-400" />
+                      <span className="text-xs font-bold text-zinc-200">
+                        商品视觉参考图 (MiniMax-H3 生成九宫格必填，最多 3 张)
+                      </span>
+                      <span className="text-[11px] text-zinc-400">
+                        已添加 <strong className="text-emerald-400">{referenceImages.length}</strong>/3 张
+                      </span>
+                    </div>
+                    {referenceImages.length < 3 && (
+                      <label className="px-3 py-1 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-medium flex items-center gap-1.5 cursor-pointer transition">
+                        <Upload className="w-3.5 h-3.5 text-cyan-400" />
+                        添加参考图
+                        <input
+                          type="file"
+                          accept="image/*"
+                          multiple
+                          onChange={handleAddReferenceImage}
+                          className="hidden"
+                        />
+                      </label>
+                    )}
+                  </div>
+
+                  {referenceImages.length > 0 ? (
+                    <div className="flex flex-wrap gap-3 pt-1">
+                      {referenceImages.map((imgBase64, idx) => (
+                        <div
+                          key={idx}
+                          className="relative w-20 h-20 rounded-lg overflow-hidden border border-zinc-700 group bg-zinc-800 shadow"
+                        >
+                          <img
+                            src={imgBase64}
+                            alt={`参考图 #${idx + 1}`}
+                            className="w-full h-full object-cover"
+                          />
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveReferenceImage(idx)}
+                            className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 flex items-center justify-center transition text-rose-400"
+                            title="删除此参考图"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                          <span className="absolute bottom-1 right-1 bg-black/70 text-[9px] px-1 rounded text-zinc-300 font-mono">
+                            #{idx + 1}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ) : (
+                    <p className="text-[11px] text-zinc-500">
+                      尚未添加参考图。MiniMax-H3-Image 自动生图需要至少 1 张清晰商品白底图或实拍图作为特征输入。若步骤 1 已上传商品主图，生图时将自动复用。
+                    </p>
+                  )}
+                </div>
+
                 {/* 分镜卡片展示 */}
                 <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
                   {scriptData.shots?.map((shot: any) => (
@@ -949,11 +1262,18 @@ export default function DashboardPage() {
                   </div>
 
                   <div className="flex items-center gap-3">
-                    <label className="px-4 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold flex items-center gap-2 cursor-pointer transition">
-                      <Upload className="w-4 h-4 text-emerald-400" />
-                      {isSlicing ? "正在切片..." : "上传 3x3 九宫格原图"}
-                      <input type="file" accept="image/*" onChange={handleUploadGrid} className="hidden" />
-                    </label>
+                    {!isGridGenerating ? (
+                      <label className="px-4 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold flex items-center gap-2 cursor-pointer transition">
+                        <Upload className="w-4 h-4 text-emerald-400" />
+                        {isSlicing ? "正在切片..." : "上传 3x3 九宫格原图"}
+                        <input type="file" accept="image/*" onChange={handleUploadGrid} className="hidden" />
+                      </label>
+                    ) : (
+                      <div className="px-3.5 py-1.5 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-300 text-xs font-semibold flex items-center gap-2 animate-pulse">
+                        <RotateCcw className="w-3.5 h-3.5 animate-spin text-cyan-400" />
+                        云端生成中，切片就绪后自动解锁审核
+                      </div>
+                    )}
 
                     {slicedFrames.length > 0 && !isGridApproved && (
                       <button
@@ -1002,6 +1322,25 @@ export default function DashboardPage() {
                       ))}
                     </div>
                   </div>
+                ) : isGridGenerating ? (
+                  <div className="border-2 border-dashed border-cyan-500/30 bg-cyan-950/10 rounded-2xl p-16 text-center space-y-4">
+                    <div className="relative w-16 h-16 mx-auto flex items-center justify-center">
+                      <div className="absolute inset-0 rounded-full border-2 border-cyan-500/20 border-t-cyan-400 animate-spin" />
+                      <Sparkles className="w-8 h-8 text-cyan-400 animate-pulse" />
+                    </div>
+                    <div className="space-y-1.5 max-w-md mx-auto">
+                      <h3 className="text-sm font-bold text-zinc-200">
+                        MiniMax-H3-Image 正在云端渲染九宫格原图...
+                      </h3>
+                      <p className="text-xs text-zinc-400 leading-relaxed">
+                        已向 Colab 任务队列分发商品分镜与参考图。生成完成后，系统将自动下载、高精度等比切片为 9 张分镜画面，并在此处展示等待您的人工审核。
+                      </p>
+                    </div>
+                    <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-zinc-800/80 border border-zinc-700/60 text-[11px] text-zinc-400 font-mono">
+                      <span className="w-2 h-2 rounded-full bg-cyan-400 animate-ping" />
+                      实时监听云端就绪事件 (每 3 秒自动轮询)
+                    </div>
+                  </div>
                 ) : (
                   <div className="border-2 border-dashed border-zinc-800 rounded-2xl p-16 text-center space-y-3">
                     <Layers className="w-10 h-10 text-zinc-600 mx-auto" />
@@ -1014,64 +1353,235 @@ export default function DashboardPage() {
             )}
 
             {/* 步骤 4：Colab 批处理与成片导出 */}
-            {activeStep === 4 && (
-              <div className="space-y-6 max-w-2xl mx-auto">
-                <div className="bg-zinc-900/60 p-6 rounded-2xl border border-zinc-800 space-y-4 text-center">
-                  <Video className="w-10 h-10 text-emerald-400 mx-auto" />
-                  <h2 className="text-base font-bold text-zinc-100">云端视频生成与本地压制</h2>
-                  <p className="text-xs text-zinc-400">
-                    九宫格关键帧已审核通过！点击下方按钮将任务推入 Colab 队列，由 MiniMax-H3 生成动态镜头。
-                  </p>
+            {activeStep === 4 && (() => {
+              const shotsList = scriptData?.shots || [];
+              const completedShotsCount = shotsList.filter((s: any) => s.status === "done" || !!s.videoPath).length;
+              const isAllClipsReady = shotsList.length > 0 && completedShotsCount === shotsList.length;
+              const isCloudGeneratingClips = currentProject?.status === "cloud_running" && !isAllClipsReady;
 
-                  <div className="flex gap-3 justify-center">
-                    <button
-                      disabled={isSubmittingCloud}
-                      onClick={handleSubmitToCloud}
-                      className="px-5 py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-bold transition cursor-pointer"
-                    >
-                      {isSubmittingCloud ? "正在下发..." : "推入 Colab 任务队列"}
-                    </button>
-
-                    <button
-                      disabled={isComposing}
-                      onClick={handleComposeFinalVideo}
-                      className="px-6 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold flex items-center gap-2 transition cursor-pointer"
-                    >
-                      {isComposing ? <RotateCcw className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5" />}
-                      本地 T4 最终合成 1080p 成片
-                    </button>
-                  </div>
-                </div>
-
-                {/* 成片在线播放器 */}
-                {finalVideoUrl && (
-                  <div className="bg-zinc-900/60 p-6 rounded-2xl border border-zinc-800 space-y-4 text-center">
-                    <span className="text-xs font-bold text-emerald-400 block">成片渲染完毕！</span>
-                    <div className="aspect-[9/16] max-w-xs mx-auto rounded-xl overflow-hidden border border-zinc-800 shadow-2xl">
-                      <video src={finalVideoUrl} controls autoPlay className="w-full h-full object-cover" />
+              return (
+                <div className="space-y-6 max-w-4xl mx-auto">
+                  {/* 控制与进度卡片 */}
+                  <div className="bg-zinc-900/60 p-6 rounded-2xl border border-zinc-800 space-y-5 text-center">
+                    <Video className="w-10 h-10 text-emerald-400 mx-auto" />
+                    <div>
+                      <h2 className="text-base font-bold text-zinc-100">云端视频生成与本地压制</h2>
+                      <p className="text-xs text-zinc-400 mt-1">
+                        九宫格关键帧已审核通过！点击推入 Colab 队列进行动态镜头生成，全部就绪后由本地 T4 压制 1080p 成片。
+                      </p>
                     </div>
-                    <div className="flex items-center justify-center gap-3">
-                      <a
-                        href={finalVideoUrl}
-                        download="clipforge_final.mp4"
-                        className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold transition shadow-lg shadow-emerald-500/20"
-                      >
-                        <Download className="w-4 h-4" />
-                        下载成片 MP4
-                      </a>
+
+                    {/* 实时分镜就绪进度条 */}
+                    <div className="space-y-2 bg-zinc-800/50 p-4 rounded-xl border border-zinc-700/60 text-left">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="font-semibold text-zinc-300 flex items-center gap-1.5">
+                          <Film className="w-4 h-4 text-cyan-400" />
+                          分镜视频渲染与下载就绪度
+                        </span>
+                        <span className="font-mono font-bold text-emerald-400">
+                          {completedShotsCount} / {shotsList.length} 镜头就绪 ({shotsList.length > 0 ? Math.round((completedShotsCount / shotsList.length) * 100) : 0}%)
+                        </span>
+                      </div>
+                      <div className="w-full bg-zinc-900 h-2.5 rounded-full overflow-hidden border border-zinc-700/50">
+                        <div
+                          className="bg-gradient-to-r from-cyan-500 to-emerald-400 h-full transition-all duration-500"
+                          style={{ width: `${shotsList.length > 0 ? (completedShotsCount / shotsList.length) * 100 : 0}%` }}
+                        />
+                      </div>
+                      <div className="flex items-center justify-between text-[11px] text-zinc-400">
+                        <span>
+                          {isAllClipsReady
+                            ? "🎉 所有分镜视频已全部就绪！请点击右侧按钮立即合成 1080p 成片。"
+                            : isCloudGeneratingClips
+                            ? "⚡ Colab 正在并行渲染与自动下载分镜视频片段 (每 3 秒自动轮询刷新)..."
+                            : "分镜已通过审核，点击下方按钮将任务推入 Colab 执行队列。"}
+                        </span>
+                        {isCloudGeneratingClips && (
+                          <span className="text-cyan-400 font-mono flex items-center gap-1 text-[10px]">
+                            <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping" />
+                            云端流式就绪中
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* 操作控制区 */}
+                    <div className="flex gap-4 justify-center items-center pt-1">
                       <button
-                        type="button"
-                        onClick={handleCopyAllVoiceovers}
-                        className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-xs font-bold text-zinc-200 transition"
+                        disabled={isSubmittingCloud || isCloudGeneratingClips}
+                        onClick={handleSubmitToCloud}
+                        className="px-5 py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-bold transition cursor-pointer disabled:opacity-50"
                       >
-                        <Copy className="w-4 h-4 text-amber-400" />
-                        复制完整台词文案
+                        {isSubmittingCloud ? (
+                          <>
+                            <RotateCcw className="w-3.5 h-3.5 animate-spin" />
+                            正在下发云端...
+                          </>
+                        ) : isCloudGeneratingClips ? (
+                          <>
+                            <RotateCcw className="w-3.5 h-3.5 animate-spin text-cyan-400" />
+                            云端生成中 ({completedShotsCount}/{shotsList.length})...
+                          </>
+                        ) : isAllClipsReady ? (
+                          "✅ 分镜已全部就绪 (可重新下发)"
+                        ) : (
+                          "推入 Colab 任务队列"
+                        )}
+                      </button>
+
+                      <button
+                        disabled={isComposing || !isAllClipsReady}
+                        onClick={handleComposeFinalVideo}
+                        className={`px-6 py-2.5 rounded-xl font-bold text-xs flex items-center gap-2 transition cursor-pointer disabled:opacity-50 ${
+                          isAllClipsReady
+                            ? "bg-emerald-500 hover:bg-emerald-400 text-black shadow-lg shadow-emerald-500/30 ring-2 ring-emerald-400 animate-pulse"
+                            : "bg-zinc-800 text-zinc-400 border border-zinc-700"
+                        }`}
+                      >
+                        {isComposing ? (
+                          <>
+                            <RotateCcw className="w-3.5 h-3.5 animate-spin" />
+                            本地 T4 正在进行多轨音画对齐与硬件压制...
+                          </>
+                        ) : (
+                          <>
+                            <Play className="w-3.5 h-3.5" />
+                            {isAllClipsReady ? "✨ 镜头全部就绪，立即一键合成 1080p 成片" : "本地 T4 最终合成 1080p 成片 (等待全部镜头)"}
+                          </>
+                        )}
                       </button>
                     </div>
                   </div>
-                )}
-              </div>
-            )}
+
+                  {/* 分镜视频就绪看板 */}
+                  {shotsList.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="font-bold text-zinc-200 flex items-center gap-2">
+                          <Film className="w-4 h-4 text-emerald-400" />
+                          分镜视频渲染状态看板 ({shotsList.length} 镜头)
+                        </span>
+                        <span className="text-[11px] text-zinc-400">已就绪 {completedShotsCount} / {shotsList.length} 个镜头</span>
+                      </div>
+
+                      <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-3">
+                        {shotsList.map((shot: any) => {
+                          const isDone = shot.status === "done" || !!shot.videoPath;
+                          let videoSrc: string | null = null;
+                          if (shot.videoPath) {
+                            if (shot.videoPath.includes("/outputs/")) {
+                              videoSrc = "/outputs/" + shot.videoPath.split("/outputs/")[1];
+                            } else {
+                              videoSrc = shot.videoPath.startsWith("/") ? shot.videoPath : `/${shot.videoPath}`;
+                            }
+                          }
+
+                          let keyframeSrc: string | null = null;
+                          if (shot.keyframePath) {
+                            if (shot.keyframePath.includes("/uploads/")) {
+                              keyframeSrc = "/uploads/" + shot.keyframePath.split("/uploads/")[1];
+                            } else {
+                              keyframeSrc = shot.keyframePath.startsWith("/") ? shot.keyframePath : `/${shot.keyframePath}`;
+                            }
+                          }
+
+                          return (
+                            <div
+                              key={shot.id}
+                              className={`p-3 rounded-xl border transition-all flex flex-col justify-between ${
+                                isDone
+                                  ? "bg-zinc-900/80 border-emerald-500/40 shadow-sm"
+                                  : isCloudGeneratingClips
+                                  ? "bg-zinc-900/50 border-cyan-500/30 animate-pulse"
+                                  : "bg-zinc-900/40 border-zinc-800"
+                              }`}
+                            >
+                              <div className="space-y-2">
+                                <div className="flex items-center justify-between text-xs">
+                                  <span className="font-bold text-zinc-200">#{shot.id} {shot.type || "分镜"}</span>
+                                  {isDone ? (
+                                    <span className="px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-400 text-[10px] font-bold flex items-center gap-0.5">
+                                      <CheckCircle2 className="w-2.5 h-2.5" />
+                                      就绪
+                                    </span>
+                                  ) : isCloudGeneratingClips ? (
+                                    <span className="px-1.5 py-0.5 rounded bg-cyan-500/20 text-cyan-300 text-[10px] font-bold flex items-center gap-0.5">
+                                      <RotateCcw className="w-2.5 h-2.5 animate-spin" />
+                                      生成中
+                                    </span>
+                                  ) : (
+                                    <span className="px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-400 text-[10px]">
+                                      等待
+                                    </span>
+                                  )}
+                                </div>
+
+                                {/* 视频微预览或关键帧切片 */}
+                                <div className="aspect-[9/16] rounded-lg overflow-hidden bg-black/60 border border-zinc-800 relative flex items-center justify-center">
+                                  {isDone && videoSrc ? (
+                                    <video
+                                      src={videoSrc}
+                                      controls
+                                      className="w-full h-full object-cover"
+                                      preload="metadata"
+                                    />
+                                  ) : keyframeSrc ? (
+                                    <img
+                                      src={keyframeSrc}
+                                      alt={`分镜 #${shot.id} 关键帧`}
+                                      className="w-full h-full object-cover opacity-60"
+                                    />
+                                  ) : (
+                                    <Video className="w-6 h-6 text-zinc-600" />
+                                  )}
+                                </div>
+
+                                <p className="text-[10px] text-zinc-400 line-clamp-2 leading-relaxed">
+                                  {shot.description}
+                                </p>
+                              </div>
+
+                              <div className="mt-2 pt-2 border-t border-zinc-800/60 flex items-center justify-between text-[10px] text-zinc-500 font-mono">
+                                <span>{shot.durationSec || 5}s</span>
+                                <span className="text-emerald-400/80">{isDone ? "本地已落盘" : "待云端返回"}</span>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 成片在线播放器 */}
+                  {finalVideoUrl && (
+                    <div className="bg-zinc-900/60 p-6 rounded-2xl border border-zinc-800 space-y-4 text-center">
+                      <span className="text-xs font-bold text-emerald-400 block">成片渲染完毕！</span>
+                      <div className="aspect-[9/16] max-w-xs mx-auto rounded-xl overflow-hidden border border-zinc-800 shadow-2xl">
+                        <video src={finalVideoUrl} controls autoPlay className="w-full h-full object-cover" />
+                      </div>
+                      <div className="flex items-center justify-center gap-3">
+                        <a
+                          href={finalVideoUrl}
+                          download="clipforge_final.mp4"
+                          className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold transition shadow-lg shadow-emerald-500/20"
+                        >
+                          <Download className="w-4 h-4" />
+                          下载成片 MP4
+                        </a>
+                        <button
+                          type="button"
+                          onClick={handleCopyAllVoiceovers}
+                          className="inline-flex items-center gap-1.5 px-5 py-2.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-xs font-bold text-zinc-200 transition"
+                        >
+                          <Copy className="w-4 h-4 text-amber-400" />
+                          复制完整台词文案
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
           </main>
         </>
       )}
