@@ -300,17 +300,19 @@ def process_single_task(task: Dict[str, Any]) -> Dict[str, Any]:
 
     # 此处调用实际的 MiniMax 推理引擎 (若处于开发模拟或未装库状态，进行自适应保障)
     try:
-        from minimax_engine import generate_video_clip, generate_grid_image
+        import importlib
+        import minimax_engine
+        importlib.reload(minimax_engine)
         if task_type == "image":
             ref_images = task.get("ref_images") or task.get("reference_images") or []
             shots = task.get("shots")
-            generate_grid_image(prompt, drive_output_path, ref_images, shots, progress_callback)
+            minimax_engine.generate_grid_image(prompt, drive_output_path, ref_images, shots, progress_callback)
         else:
             keyframe_b64 = task.get("keyframe_b64")
             duration_sec = task.get("duration_sec", 5)
-            generate_video_clip(prompt, keyframe_b64, duration_sec, drive_output_path, progress_callback)
+            minimax_engine.generate_video_clip(prompt, keyframe_b64, duration_sec, drive_output_path, progress_callback)
     except Exception as e:
-        print(f"[TASK-SIM] 推理引擎调用 (或模拟回退): {e}", flush=True)
+        print(f"[TASK-ERR] 推理引擎执行异常: {e}", flush=True)
         # 兜底生成标记文件，保证端到端不阻塞
         if not os.path.exists(drive_output_path):
             with open(drive_output_path, "wb") as f:
