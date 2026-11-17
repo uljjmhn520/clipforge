@@ -9,6 +9,8 @@ import { eq } from "drizzle-orm";
 import { join } from "path";
 import { existsSync, mkdirSync } from "fs";
 
+import { toLocalDiskPath } from "@/lib/utils/path-helpers";
+
 export async function POST(req: Request) {
   try {
     const body = await req.json();
@@ -57,10 +59,13 @@ export async function POST(req: Request) {
       const cards = splitIntoCaptionCards(shot.voiceover, 0, actualDuration);
 
       // 视频路径：优先使用生成好的视频，若未就绪则使用关键帧静态图片或系统占位图
-      let videoSource = shot.videoPath;
-      if (!videoSource || !existsSync(videoSource)) {
-        videoSource = shot.keyframePath && existsSync(shot.keyframePath)
-          ? shot.keyframePath
+      const diskVideoPath = toLocalDiskPath(shot.videoPath);
+      const diskKeyframePath = toLocalDiskPath(shot.keyframePath);
+
+      let videoSource = diskVideoPath && existsSync(diskVideoPath) ? diskVideoPath : "";
+      if (!videoSource) {
+        videoSource = diskKeyframePath && existsSync(diskKeyframePath)
+          ? diskKeyframePath
           : join(process.cwd(), "public", "placeholder.png");
       }
 

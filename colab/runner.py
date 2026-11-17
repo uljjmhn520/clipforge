@@ -38,6 +38,15 @@ STATE = {
         "message": "正在初始化通信隧道...",
         "log_tail": []
     },
+    "current_progress": {
+        "taskId": None,
+        "taskType": None,
+        "percent": 0,
+        "step": "idle",
+        "message": "空闲等待任务中",
+        "elapsedSec": 0.0,
+        "extra": {}
+    },
     "lock": threading.Lock()
 }
 
@@ -49,23 +58,286 @@ COMPLETED_DIR = os.path.join(TASKS_DIR, "completed")
 FAILED_DIR = os.path.join(TASKS_DIR, "failed")
 DRIVE_OUTPUT_DIR = "/content/drive/MyDrive/ClipForge/outputs"
 LOCAL_OUTPUT_DIR = "/content/outputs"
+TUNNEL_URL_FILE = "/content/tunnel_url.txt"
+STATE["tunnel_url"] = None
 
 # 全局网络流量采样
 _LAST_NET_BYTES = 0
 _LAST_NET_TIME = time.time()
 
+# 线程安全输出队列与异步投递机制
+import queue
+import re
+
+try:
+    from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+    from fastapi.responses import FileResponse, JSONResponse
+    from fastapi.middleware.cors import CORSMiddleware
+    import uvicorn
+    import asyncio
+    HAS_FASTAPI = True
+except ImportError:
+    HAS_FASTAPI = False
+    FastAPI = None
+    WebSocket = None
+
+_LOOP = None
+_ACTIVE_WEBSOCKETS: set = set()
+_WS_LOCK = threading.Lock()
+_OUTPUT_QUEUE: "queue.Queue[str]" = queue.Queue()
+
+async def _broadcast_ws(data_dict: dict):
+    """向所有连接的 WebSocket 客户端广播事件帧"""
+    if not HAS_FASTAPI or not _ACTIVE_WEBSOCKETS:
+        return
+    text = json.dumps(data_dict, ensure_ascii=False)
+    with _WS_LOCK:
+        clients = list(_ACTIVE_WEBSOCKETS)
+    dead = []
+    for client in clients:
+        try:
+            await client.send_text(text)
+        except Exception:
+            dead.append(client)
+    if dead:
+        with _WS_LOCK:
+            for d in dead:
+                _ACTIVE_WEBSOCKETS.discard(d)
+
+def _stdout_writer_daemon():
+    """独占输出守护线程：保证所有 RPC 消息单线程、有序、原子写入 stdout，绝不阻塞任何工作线程"""
+    while True:
+        try:
+            line = _OUTPUT_QUEUE.get()
+            if line is None:
+                break
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+def send_rpc_raw(data: dict):
+    """向标准输出投递原始 JSON 消息（无锁高吞吐投递，并同时广播给 WebSocket 客户端）"""
+    try:
+        _OUTPUT_QUEUE.put(json.dumps(data, ensure_ascii=False))
+        if HAS_FASTAPI and _LOOP and _LOOP.is_running():
+            asyncio.run_coroutine_threadsafe(_broadcast_ws(data), _LOOP)
+    except Exception:
+        pass
+
 def send_rpc_event(method: str, params: Dict[str, Any]):
-    """向标准输出投递异步通知事件 (JSON-RPC Notification)"""
-    event = {
+    """向标准输出与 WebSocket 客户端投递异步通知事件 (JSON-RPC Notification)"""
+    send_rpc_raw({
         "jsonrpc": "2.0",
         "method": method,
         "params": params
-    }
+    })
+
+def process_rpc_frame(req: dict) -> Optional[dict]:
+    """统一处理 JSON-RPC 请求，支持 stdio 与 WebSocket 共享复用"""
+    req_id = req.get("id")
+    method = req.get("method")
+    params = req.get("params", {})
+
+    if method == "heartbeat.ping":
+        with STATE["lock"]:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "result": {
+                    "pong": True,
+                    "sessionName": STATE["session_name"],
+                    "lifecycle": STATE["lifecycle"],
+                    "state": STATE["status"],
+                    "currentTask": STATE["current_task"],
+                    "currentProgress": STATE["current_progress"],
+                    "idleSecondsLeft": STATE["idle_seconds_left"],
+                    "envReady": STATE["env_ready"],
+                    "tunnelUrl": STATE["tunnel_url"],
+                    "installProgress": STATE["install_progress"],
+                    "hardware": _CACHED_METRICS
+                }
+            }
+
+    elif method == "watchdog.extend":
+        add_sec = int(params.get("seconds", 900))
+        with STATE["lock"]:
+            STATE["idle_seconds_left"] += add_sec
+        return {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"extended": True, "idleSecondsLeft": STATE["idle_seconds_left"]}
+        }
+
+    elif method == "watchdog.shutdown":
+        resp = {"jsonrpc": "2.0", "id": req_id, "result": {"shuttingDown": True}}
+        send_rpc_raw(resp)
+        try:
+            from google.colab import runtime
+            runtime.unassign()
+        except Exception:
+            os._exit(0)
+        return None
+
+    elif method == "task.submit":
+        task_id = params.get("taskId") or f"rpc_{int(time.time()*1000)}"
+        task_file = os.path.join(PENDING_DIR, f"{int(time.time())}_{task_id}.json")
+        with open(task_file, "w", encoding="utf-8") as f:
+            json.dump(params, f, ensure_ascii=False, indent=2)
+        return {"jsonrpc": "2.0", "id": req_id, "result": {"queued": True, "taskId": task_id}}
+
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Method {method} not found"}}
+
+if HAS_FASTAPI:
+    app = FastAPI(title="ClipForge Colab Runner API")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @app.get("/health")
+    def health_http():
+        return {"status": "ok", "session": STATE["session_name"], "lifecycle": STATE["lifecycle"]}
+
+    @app.get("/status")
+    def get_status_http():
+        with STATE["lock"]:
+            return {
+                "sessionName": STATE["session_name"],
+                "lifecycle": STATE["lifecycle"],
+                "state": STATE["status"],
+                "currentTask": STATE["current_task"],
+                "currentProgress": STATE["current_progress"],
+                "idleSecondsLeft": STATE["idle_seconds_left"],
+                "envReady": STATE["env_ready"],
+                "tunnelUrl": STATE["tunnel_url"],
+                "hardware": _CACHED_METRICS
+            }
+
+    @app.get("/outputs/{filename}")
+    def get_output_file_http(filename: str):
+        filepath = os.path.join(LOCAL_OUTPUT_DIR, filename)
+        if os.path.exists(filepath):
+            return FileResponse(filepath)
+        return JSONResponse(status_code=404, content={"error": f"File {filename} not found"})
+
+    @app.post("/tasks/submit")
+    def submit_task_http(task_data: dict):
+        task_id = task_data.get("taskId") or f"http_{int(time.time()*1000)}"
+        task_file = os.path.join(PENDING_DIR, f"{int(time.time())}_{task_id}.json")
+        with open(task_file, "w", encoding="utf-8") as f:
+            json.dump(task_data, f, ensure_ascii=False, indent=2)
+        return {"queued": True, "taskId": task_id}
+
+    @app.websocket("/ws")
+    async def websocket_endpoint(websocket: WebSocket):
+        await websocket.accept()
+        with _WS_LOCK:
+            _ACTIVE_WEBSOCKETS.add(websocket)
+        try:
+            while True:
+                data_text = await websocket.receive_text()
+                try:
+                    req = json.loads(data_text)
+                    resp = process_rpc_frame(req)
+                    if resp:
+                        await websocket.send_text(json.dumps(resp, ensure_ascii=False))
+                except Exception as e:
+                    err_resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": str(e)}}
+                    await websocket.send_text(json.dumps(err_resp, ensure_ascii=False))
+        except WebSocketDisconnect:
+            pass
+        finally:
+            with _WS_LOCK:
+                _ACTIVE_WEBSOCKETS.discard(websocket)
+
+def ensure_cloudflared_installed() -> bool:
+    """自动安装 cloudflared 二进制程序至 /usr/local/bin (耗时约 2~3 秒)"""
+    if shutil.which("cloudflared") and os.path.exists("/usr/local/bin/cloudflared"):
+        return True
+    print("[TUNNEL] 正在自动安装 Cloudflare Tunnel (cloudflared)...", flush=True)
     try:
-        sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
-    except Exception:
-        pass
+        url = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+        subprocess.run(["curl", "-fsSL", "-o", "/usr/local/bin/cloudflared", url], timeout=30, check=True)
+        subprocess.run(["chmod", "+x", "/usr/local/bin/cloudflared"], check=True)
+        print("[TUNNEL] cloudflared 自动安装完成！", flush=True)
+        return True
+    except Exception as e:
+        print(f"[TUNNEL] 自动安装 cloudflared 异常: {e}", flush=True)
+        return False
+
+def start_cloudflared_tunnel_daemon(port: int = 8000):
+    """启动 Cloudflare Quick Tunnel 守护进程，提取动态 trycloudflare 域名并写入 /content/tunnel_url.txt"""
+    if not shutil.which("cloudflared"):
+        if not ensure_cloudflared_installed():
+            # 轮询等待 setup_env.sh 或外部安装完成
+            for _ in range(30):
+                time.sleep(2)
+                if shutil.which("cloudflared"):
+                    break
+    if not shutil.which("cloudflared"):
+        print("[TUNNEL] cloudflared 安装未就绪，跳过隧道启动", flush=True)
+        return
+    cmd = ["cloudflared", "tunnel", "--url", f"http://127.0.0.1:{port}"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        t0 = time.time()
+        tunnel_url = None
+        while time.time() - t0 < 45:
+            line = proc.stderr.readline()
+            if not line:
+                time.sleep(0.2)
+                continue
+            if "trycloudflare.com" in line:
+                m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+                if m:
+                    tunnel_url = m.group(0)
+                    break
+        if tunnel_url:
+            print(f"[TUNNEL] Cloudflare 穿透隧道建立成功: {tunnel_url}", flush=True)
+            STATE["tunnel_url"] = tunnel_url
+            try:
+                with open(TUNNEL_URL_FILE, "w", encoding="utf-8") as f:
+                    f.write(tunnel_url.strip())
+            except Exception:
+                pass
+            send_rpc_event("tunnel.ready", {"tunnelUrl": tunnel_url})
+        else:
+            print("[TUNNEL] 45秒内未提取到 trycloudflare.com 域名", flush=True)
+    except Exception as e:
+        print(f"[TUNNEL] 运行 cloudflared 异常: {e}", flush=True)
+
+# 异步解耦的硬件指标缓存 (避免 ping 同步调用 nvidia-smi 产生阻塞)
+_CACHED_METRICS = {
+    "cpu": {"percent": 0.0, "note": "GPU 推理中，CPU 负载偏低属正常现象"},
+    "ram": {"usedMb": 0, "totalMb": 0, "percent": 0.0},
+    "gpu": {"name": "NVIDIA L4", "utilizationPercent": 0.0, "memoryUsedMb": 0, "memoryTotalMb": 23034, "memoryPercent": 0.0},
+    "net": {"downloadSpeedMbps": 0.0},
+    "last_update": 0.0
+}
+
+def metrics_collector_daemon():
+    """独立硬件指标采集线程：将 nvidia-smi 与网络监控解耦至独立后台线程，绝不阻塞通信循环"""
+    global _CACHED_METRICS
+    while True:
+        try:
+            cpu_p = get_cpu_percent()
+            ram_i = get_ram_info()
+            gpu_i = get_gpu_info()
+            net_s = get_net_download_mbps()
+            _CACHED_METRICS = {
+                "cpu": {"percent": cpu_p, "note": "GPU 推理中，CPU 负载偏低属正常现象"},
+                "ram": ram_i,
+                "gpu": gpu_i,
+                "net": {"downloadSpeedMbps": net_s},
+                "last_update": time.time()
+            }
+        except Exception:
+            pass
+        time.sleep(2.0)
 
 def get_net_download_mbps() -> float:
     """计算网络下行瞬时速率 (Mbps)"""
@@ -186,11 +458,31 @@ def get_completed_tasks_summary() -> List[Dict[str, Any]]:
     if os.path.exists(COMPLETED_DIR):
         for name in sorted(os.listdir(COMPLETED_DIR), reverse=True)[:50]:
             p = os.path.join(COMPLETED_DIR, name)
-            res_file = os.path.join(p, "result.json")
-            if os.path.exists(res_file):
+            if os.path.isdir(p):
+                res_file = os.path.join(p, "result.json")
+                if os.path.exists(res_file):
+                    try:
+                        with open(res_file, "r", encoding="utf-8") as rf:
+                            summary.append(json.load(rf))
+                    except Exception:
+                        pass
+            elif p.endswith(".json"):
                 try:
-                    with open(res_file, "r", encoding="utf-8") as rf:
-                        summary.append(json.load(rf))
+                    with open(p, "r", encoding="utf-8") as rf:
+                        data = json.load(rf)
+                        tid = data.get("taskId") or data.get("task_id")
+                        ofile = data.get("outputFile") or data.get("drive_file")
+                        if not ofile:
+                            target_dir = DRIVE_OUTPUT_DIR if os.path.exists("/content/drive/MyDrive") else LOCAL_OUTPUT_DIR
+                            ofile = os.path.join(target_dir, f"{tid}_grid.png")
+                        summary.append({
+                            "taskId": tid,
+                            "task_id": tid,
+                            "status": "completed",
+                            "outputFile": ofile,
+                            "drive_file": ofile,
+                            "driveFile": ofile,
+                        })
                 except Exception:
                     pass
     return summary
@@ -325,15 +617,20 @@ def execute_task_packet(task_data: dict, task_work_dir: str) -> dict:
     os.makedirs(target_dir, exist_ok=True)
 
     def progress_callback(pct: int, step_name: str, message: str, extra: Optional[dict] = None):
-        send_rpc_event("task.progress", {
+        elapsed = round(time.time() - t0, 1)
+        prog_data = {
             "taskId": task_id,
+            "task_id": task_id,
             "taskType": task_type,
             "percent": pct,
             "step": step_name,
             "message": message,
-            "elapsedSec": round(time.time() - t0, 1),
+            "elapsedSec": elapsed,
             "extra": extra or {}
-        })
+        }
+        with STATE["lock"]:
+            STATE["current_progress"] = prog_data
+        send_rpc_event("task.progress", prog_data)
 
     progress_callback(5, "init", f"开始执行 {task_type} 任务: {task_id}")
 
@@ -359,9 +656,12 @@ def execute_task_packet(task_data: dict, task_work_dir: str) -> dict:
         elapsed = round(time.time() - t0, 2)
         return {
             "taskId": task_id,
+            "task_id": task_id,
             "taskType": task_type,
             "status": "completed",
             "outputFile": output_file,
+            "drive_file": output_file,
+            "driveFile": output_file,
             "elapsedSec": elapsed,
             "fileSize": os.path.getsize(output_file) if os.path.exists(output_file) else 0
         }
@@ -406,9 +706,12 @@ def execute_task_packet(task_data: dict, task_work_dir: str) -> dict:
         elapsed = round(time.time() - t0, 2)
         return {
             "taskId": task_id,
+            "task_id": task_id,
             "taskType": task_type,
             "status": "completed",
             "outputFile": output_file,
+            "drive_file": output_file,
+            "driveFile": output_file,
             "elapsedSec": elapsed,
             "fileSize": os.path.getsize(output_file) if os.path.exists(output_file) else 0
         }
@@ -514,6 +817,15 @@ def task_directory_scanner_thread():
                         STATE["lifecycle"] = "IDLE"
                         STATE["status"] = "IDLE"
                         STATE["current_task"] = None
+                        STATE["current_progress"] = {
+                            "taskId": None,
+                            "taskType": None,
+                            "percent": 100 if result and result.get("status") == "completed" else 0,
+                            "step": "idle",
+                            "message": "空闲等待任务中",
+                            "elapsedSec": 0.0,
+                            "extra": {}
+                        }
 
             else:
                 # 队列暂空，休眠 1 秒
@@ -522,55 +834,99 @@ def task_directory_scanner_thread():
         except Exception as e:
             time.sleep(2)
 
+def check_comfyui_has_active_prompt() -> bool:
+    """检查 ComfyUI 是否有正在运行或排队的 Prompt"""
+    try:
+        req = urllib.request.Request("http://127.0.0.1:8188/queue", headers={"User-Agent": "ClipForge"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            running = data.get("queue_running", [])
+            pending = data.get("queue_pending", [])
+            return len(running) > 0 or len(pending) > 0
+    except Exception:
+        return False
+
+def check_active_generation_processes() -> bool:
+    """检查系统层是否有 ffmpeg、minimax_engine 或 comfyui 活跃计算进程"""
+    try:
+        res = subprocess.run(["pgrep", "-f", "ffmpeg|minimax_engine"], capture_output=True)
+        return res.returncode == 0 and bool(res.stdout.strip())
+    except Exception:
+        return False
+
+def check_is_busy_multi_factor() -> tuple:
+    """
+    多维智能忙碌感知：
+    1. 内部生命周期状态：STATE["status"] == "BUSY" 或未安装完成 (STATE["lifecycle"] == "INSTALLING_MODELS" 或 not STATE["env_ready"])
+    2. 任务队列目录：/content/tasks/pending 或 /content/tasks/running 存在待处理或执行中的文件
+    3. ComfyUI 内部队列：正在执行 prompt 或有排队
+    4. GPU 计算核心负载：利用率 > 5.0%
+    5. 核心渲染进程：ffmpeg、minimax_engine 正在活跃运行
+    只要满足任一条件，即判定为 BUSY 并无条件冻结看门狗！
+    """
+    # 维度 1: 内部状态
+    if STATE["status"] == "BUSY":
+        return True, "正在执行任务 (STATE=BUSY)"
+    if not STATE["env_ready"] or STATE["lifecycle"] == "INSTALLING_MODELS":
+        return True, "正在安装环境/下载模型权重"
+
+    # 维度 2: 任务队列目录
+    if os.path.exists(RUNNING_DIR) and len(os.listdir(RUNNING_DIR)) > 0:
+        return True, "任务目录 running/ 存在活跃任务包"
+    if os.path.exists(PENDING_DIR) and len(os.listdir(PENDING_DIR)) > 0:
+        return True, "任务目录 pending/ 存在待分发任务包"
+
+    # 维度 3: ComfyUI 队列
+    if check_comfyui_has_active_prompt():
+        return True, "ComfyUI 内部队列正在执行扩散推理"
+
+    # 维度 4: GPU 核心负载 (GPU 利用率 > 5% 判定为活跃计算中)
+    gpu_util = _CACHED_METRICS.get("gpu", {}).get("utilizationPercent", 0.0)
+    if gpu_util > 5.0:
+        return True, f"GPU 活跃计算中 (利用率: {gpu_util}%)"
+
+    # 维度 5: 核心渲染进程
+    if check_active_generation_processes():
+        return True, "检测到活跃的多媒体渲染进程 (ffmpeg/minimax_engine)"
+
+    return False, "空闲"
+
 def metrics_reporter_thread():
-    """后台硬件监控指标上报：每 2 秒向本地同步最新 CPU/GPU/显存/网络与看门狗状态"""
+    """后台硬件监控指标上报：每 2 秒向本地同步最新硬件与看门狗状态"""
     while True:
         time.sleep(2)
         try:
-            cpu_pct = get_cpu_percent()
-            ram_info = get_ram_info()
-            gpu_info = get_gpu_info()
-            net_mbps = get_net_download_mbps()
-
-            # 计算队列中的任务数量
             pending_count = len(os.listdir(PENDING_DIR)) if os.path.exists(PENDING_DIR) else 0
+            is_busy, busy_reason = check_is_busy_multi_factor()
 
             with STATE["lock"]:
-                STATE["install_progress"]["speed_mbps"] = net_mbps
+                STATE["install_progress"]["speed_mbps"] = _CACHED_METRICS.get("net", {}).get("downloadSpeedMbps", 0.0)
                 send_rpc_event("system.metrics", {
                     "sessionName": STATE["session_name"],
                     "lifecycle": STATE["lifecycle"],
                     "status": STATE["status"],
                     "currentTask": STATE["current_task"],
+                    "currentProgress": STATE["current_progress"],
                     "pendingTasksCount": pending_count,
                     "watchdog": {
                         "idleSecondsLeft": STATE["idle_seconds_left"],
-                        "isFrozen": STATE["status"] == "BUSY" or not STATE["env_ready"]
+                        "isFrozen": is_busy
                     },
                     "installProgress": STATE["install_progress"],
-                    "hardware": {
-                        "cpu": {
-                            "percent": cpu_pct,
-                            "note": "GPU 推理或网络下载中，CPU 负载较低属正常现象"
-                        },
-                        "ram": ram_info,
-                        "gpu": gpu_info,
-                        "net": {
-                            "downloadSpeedMbps": net_mbps
-                        }
-                    }
+                    "hardware": _CACHED_METRICS
                 })
         except Exception:
             pass
 
 def idle_watchdog_thread():
-    """两阶段看门狗：BUSY 与环境安装中计时彻底冻结，IDLE 默认 5 分钟自动安全关机"""
-    print(f"[WATCHDOG-2] 忙闲看门狗激活，空闲阈值: {STATE['idle_timeout_seconds']} 秒", flush=True)
+    """两阶段多维看门狗：BUSY、模型下载、GPU 负载、ComfyUI 队列与渲染进程存活期间彻底冻结计时，连续空闲 15 分钟自动释放"""
+    print(f"[WATCHDOG-2] 多维智能看门狗激活，空闲阈值: {STATE['idle_timeout_seconds']} 秒 (15分钟)", flush=True)
+    last_reason = ""
     while True:
         time.sleep(1)
         now = time.time()
 
-        # 绝对生命周期硬上限检查
+        # 绝对生命周期硬上限检查 (4 小时)
         if now - STATE["started_at"] > STATE["max_lifetime_seconds"]:
             print("[WATCHDOG] 触发实例硬性绝对寿命上限 (4小时)，强制关机防超额扣费！", flush=True)
             try:
@@ -579,15 +935,20 @@ def idle_watchdog_thread():
             except Exception:
                 os._exit(0)
 
-        # 忙闲倒计时计算
+        is_busy, busy_reason = check_is_busy_multi_factor()
+
         with STATE["lock"]:
-            if STATE["status"] == "BUSY" or not STATE["env_ready"]:
-                # 忙时或未安装完毕：重置并冻结倒计时！
+            if is_busy:
+                # 忙碌状态：重置并彻底冻结倒计时！
                 STATE["idle_seconds_left"] = STATE["idle_timeout_seconds"]
+                if busy_reason != last_reason:
+                    print(f"[WATCHDOG] 忙碌状态锁定 (倒计时冻结): {busy_reason}", flush=True)
+                    last_reason = busy_reason
             else:
+                last_reason = ""
                 STATE["idle_seconds_left"] -= 1
                 if STATE["idle_seconds_left"] <= 0:
-                    print("[WATCHDOG] 实例空闲超时达到 5 分钟！正在执行关机释放...", flush=True)
+                    print(f"[WATCHDOG] 实例连续空闲达到 {STATE['idle_timeout_seconds']//60} 分钟且无任何后台活动！正在执行安全释放...", flush=True)
                     try:
                         from google.colab import runtime
                         runtime.unassign()
@@ -595,89 +956,59 @@ def idle_watchdog_thread():
                         os._exit(0)
 
 def handle_stdin_rpc():
-    """主线程：处理标准输入的 JSON-RPC 请求"""
-    for raw_line in sys.stdin:
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            req = json.loads(line)
-            req_id = req.get("id")
-            method = req.get("method")
-            params = req.get("params", {})
+    """主线程：处理标准输入的 JSON-RPC 请求，通过 process_rpc_frame 与异步响应机制杜绝阻塞"""
+    try:
+        for raw_line in sys.stdin:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                req = json.loads(line)
+                resp = process_rpc_frame(req)
+                if resp:
+                    send_rpc_raw(resp)
+            except Exception as e:
+                err_resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": str(e)}}
+                send_rpc_raw(err_resp)
+    except Exception:
+        pass
 
-            if method == "heartbeat.ping":
-                with STATE["lock"]:
-                    resp = {
-                        "jsonrpc": "2.0",
-                        "id": req_id,
-                        "result": {
-                            "pong": True,
-                            "sessionName": STATE["session_name"],
-                            "lifecycle": STATE["lifecycle"],
-                            "state": STATE["status"],
-                            "currentTask": STATE["current_task"],
-                            "idleSecondsLeft": STATE["idle_seconds_left"],
-                            "envReady": STATE["env_ready"],
-                            "completedTasks": get_completed_tasks_summary(),
-                            "installProgress": STATE["install_progress"],
-                            "hardware": {
-                                "cpu": {"percent": get_cpu_percent()},
-                                "ram": get_ram_info(),
-                                "gpu": get_gpu_info()
-                            }
-                        }
-                    }
-                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
-
-            elif method == "watchdog.extend":
-                add_sec = int(params.get("seconds", 900))  # 默认加 15 分钟
-                with STATE["lock"]:
-                    STATE["idle_seconds_left"] += add_sec
-                resp = {
-                    "jsonrpc": "2.0",
-                    "id": req_id,
-                    "result": {"extended": True, "idleSecondsLeft": STATE["idle_seconds_left"]}
-                }
-                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
-
-            elif method == "watchdog.shutdown":
-                resp = {"jsonrpc": "2.0", "id": req_id, "result": {"shuttingDown": True}}
-                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
-                try:
-                    from google.colab import runtime
-                    runtime.unassign()
-                except Exception:
-                    os._exit(0)
-
-            elif method == "task.submit":
-                # 直接通过 RPC 投递任务
-                task_id = params.get("taskId") or f"rpc_{int(time.time()*1000)}"
-                task_file = os.path.join(PENDING_DIR, f"{int(time.time())}_{task_id}.json")
-                with open(task_file, "w", encoding="utf-8") as f:
-                    json.dump(params, f, ensure_ascii=False, indent=2)
-                resp = {"jsonrpc": "2.0", "id": req_id, "result": {"queued": True, "taskId": task_id}}
-                sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-                sys.stdout.flush()
-
-        except Exception as e:
-            err_resp = {"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": str(e)}}
-            sys.stdout.write(json.dumps(err_resp, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+    # 若 stdin 结束（如作为无头 daemon 运行），主线程持续常驻，等待看门狗超时或外部请求
+    while True:
+        time.sleep(1)
 
 def main():
     parser = argparse.ArgumentParser(description="ClipForge Colab Protocol Runner")
     parser.add_argument("--session-name", default="clipforge_default", help="专属 Session 标识")
-    parser.add_argument("--idle-timeout", type=int, default=5, help="空闲超时分钟数")
+    parser.add_argument("--idle-timeout", type=int, default=15, help="空闲超时分钟数 (默认 15 分钟)")
     parser.add_argument("--skip-install", action="store_true", help="跳过模型下载与环境安装 (调试用)")
     args = parser.parse_args()
 
     STATE["session_name"] = args.session_name
     STATE["idle_timeout_seconds"] = args.idle_timeout * 60
     STATE["idle_seconds_left"] = STATE["idle_timeout_seconds"]
+
+    # 0. 启动标准输出独占守护线程与异步硬件指标采样线程 (保证双向通信绝不阻塞)
+    t_writer = threading.Thread(target=_stdout_writer_daemon, daemon=True)
+    t_writer.start()
+    t_collector = threading.Thread(target=metrics_collector_daemon, daemon=True)
+    t_collector.start()
+
+    # 0.1 若环境支持 FastAPI 则启动 Web 服务与 Cloudflare 隧道 (释放 colab ssh 单连接限制)
+    if HAS_FASTAPI:
+        def _fastapi_thread_func():
+            global _LOOP
+            _LOOP = asyncio.new_event_loop()
+            asyncio.set_event_loop(_LOOP)
+            config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="warning", loop="asyncio")
+            server = uvicorn.Server(config)
+            _LOOP.run_until_complete(server.serve())
+
+        t_api = threading.Thread(target=_fastapi_thread_func, daemon=True)
+        t_api.start()
+
+        t_tunnel = threading.Thread(target=start_cloudflared_tunnel_daemon, args=(8000,), daemon=True)
+        t_tunnel.start()
 
     # 1. 创建工作目录
     ensure_directories()

@@ -6,13 +6,16 @@ import { localTaskDispatcher } from "./local-dispatcher";
 import { slice3x3GridImage } from "../storyboard/slicer";
 import { join } from "path";
 import { existsSync, readFileSync } from "fs";
+import { normalizeWebPath } from "@/lib/utils/path-helpers";
 
 export class TaskManager {
   constructor() {
-    // 监听云端完成通知，全自动触发 colab download 与本地挂载
-    colabClient.on("task_completed", async (payload: { task_id?: string; drive_file?: string }) => {
-      if (payload && payload.task_id) {
-        await this.onCloudTaskCompleted(payload.task_id, payload.drive_file || "");
+    // 监听云端完成通知，全自动触发 colab download 与本地挂载 (兼容 camelCase 与 snake_case)
+    colabClient.on("task_completed", async (payload: any) => {
+      const taskId = payload?.taskId || payload?.task_id;
+      const driveFile = payload?.outputFile || payload?.drive_file || payload?.driveFile || "";
+      if (taskId) {
+        await this.onCloudTaskCompleted(taskId, driveFile);
       }
     });
 
@@ -348,14 +351,15 @@ export class TaskManager {
           if (scriptRecord && scriptRecord.shots) {
             const updatedShots = scriptRecord.shots.map((shot) => {
               const matched = slices.find((s) => s.index === shot.id);
+              const kf = matched ? (normalizeWebPath(matched.filePath) || matched.filePath) : (normalizeWebPath(shot.keyframePath) || shot.keyframePath);
               return {
                 ...shot,
-                keyframePath: matched ? matched.filePath : shot.keyframePath,
+                keyframePath: kf || undefined,
               };
             });
 
             await db.update(scripts).set({
-              gridImagePath: localGridPath,
+              gridImagePath: normalizeWebPath(localGridPath) || localGridPath,
               shots: updatedShots,
             }).where(eq(scripts.id, scriptRecord.id));
           }
@@ -378,6 +382,7 @@ export class TaskManager {
         // B. 若为分镜短视频任务 (shotId > 0)
         const localDestDir = join(process.cwd(), "public", "outputs", taskRecord.projectId, "clips");
         const localVideoPath = await colabClient.downloadFile(driveFile, localDestDir);
+        const webVideoPath = normalizeWebPath(localVideoPath) || localVideoPath;
 
         // 回填至对应的 script.shots
         const scriptRecord = await db.query.scripts.findFirst({
@@ -389,7 +394,7 @@ export class TaskManager {
             if (shot.id === taskRecord.shotId) {
               return {
                 ...shot,
-                videoPath: localVideoPath,
+                videoPath: webVideoPath,
                 status: "done" as const,
               };
             }

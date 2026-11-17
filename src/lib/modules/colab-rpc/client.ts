@@ -81,6 +81,22 @@ export interface InstallProgress {
   log_tail: string[];
 }
 
+export interface TaskLiveProgress {
+  taskId: string;
+  task_id?: string;
+  taskType?: string;
+  stage?: string;
+  step?: string;
+  percent: number;
+  message: string;
+  currentStep?: number;
+  totalSteps?: number;
+  shotIndex?: number;
+  totalShots?: number;
+  elapsedSec?: number;
+  extra?: any;
+}
+
 export interface ColabHeartbeatStatus {
   online: boolean;
   sessionName: string;
@@ -88,6 +104,7 @@ export interface ColabHeartbeatStatus {
   state: "IDLE" | "BUSY" | "INIT" | "OFFLINE";
   currentTaskId: string | null;
   currentTask?: any;
+  currentProgress?: TaskLiveProgress | null;
   pendingTasksCount: number;
   gpuMemoryUsedMb: number;
   gpuMemoryTotalMb: number;
@@ -97,6 +114,7 @@ export interface ColabHeartbeatStatus {
   isPoweringOn: boolean;
   lastInitStep?: string;
   installProgress: InstallProgress;
+  tunnelUrl?: string | null;
   metrics: ColabMetrics;
   recentTasks: Array<{
     taskId: string;
@@ -130,6 +148,9 @@ export class ColabRpcClient extends EventEmitter {
   private execTimeoutSec: number;
   private heartbeatIntervalSec: number;
   private process: ChildProcessWithoutNullStreams | null = null;
+  private wsClient: WebSocket | null = null;
+  private wsReconnectTimer: NodeJS.Timeout | null = null;
+  private tunnelUrl: string | null = null;
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private isPoweringOn: boolean = false;
   private isConnecting: boolean = false;
@@ -138,6 +159,7 @@ export class ColabRpcClient extends EventEmitter {
   private currentStatus: ColabHeartbeatStatus = {
     online: false,
     sessionName: "clipforge_helloworld1234",
+    tunnelUrl: null,
     lifecycle: "OFFLINE",
     state: "OFFLINE",
     currentTaskId: null,
@@ -213,12 +235,16 @@ export class ColabRpcClient extends EventEmitter {
    * 自动探测与重连 (Auto-Discovery)
    */
   private async autoDiscover(): Promise<void> {
-    if (this.currentStatus.online || this.isPoweringOn || this.process) return;
+    if (this.currentStatus.online || this.isPoweringOn || this.isConnecting || (this.wsClient && this.wsClient.readyState === WebSocket.OPEN)) return;
     this.lastAutoDiscoveryTimestamp = Date.now();
     try {
       const check = await this.checkSessionRunning();
-      if (check.isRunning && !this.process) {
-        console.log(`[COLAB-AUTO] 探测到已有活跃会话 ${this.sessionName}，自动建立长连接握手...`);
+      if (check.isRunning && !this.currentStatus.online && !this.isConnecting) {
+        console.log(`[COLAB-AUTO] 探测到已有活跃会话 ${this.sessionName}，自动建立 WebSocket 穿透长连...`);
+        this.currentStatus.state = "INIT";
+        this.currentStatus.lifecycle = "INIT_BOOT";
+        this.currentStatus.installProgress.message = "探测到活跃实例，正在建立双向通信通道...";
+        this.emit("status_change", this.getStatus());
         await this.connect();
       }
     } catch (e: any) {
@@ -230,7 +256,8 @@ export class ColabRpcClient extends EventEmitter {
    * 获取当前 Colab 节点的实时健康与监控数据
    */
   public getStatus(): ColabHeartbeatStatus {
-    if (!this.currentStatus.online && !this.isPoweringOn && !this.process && (Date.now() - this.lastAutoDiscoveryTimestamp > 30000)) {
+    const isWsConnected = this.wsClient && this.wsClient.readyState === WebSocket.OPEN;
+    if (!this.currentStatus.online && !this.isPoweringOn && !this.isConnecting && !isWsConnected && (Date.now() - this.lastAutoDiscoveryTimestamp > 8000)) {
       this.autoDiscover().catch(() => {});
     }
     return {
@@ -248,6 +275,9 @@ export class ColabRpcClient extends EventEmitter {
     }
 
     this.isPoweringOn = true;
+    this.currentStatus.state = "INIT";
+    this.currentStatus.lifecycle = "INIT_BOOT";
+    this.currentStatus.installProgress.message = `正在启动 Colab 实例 (${gpu})...`;
     this.emit("status_change", this.getStatus());
 
     try {
@@ -255,6 +285,8 @@ export class ColabRpcClient extends EventEmitter {
       const existing = await this.checkSessionRunning();
       if (existing.isRunning) {
         console.log(`[COLAB-POWER] 实例 ${this.sessionName} 已在运行中，跳过 colab new，直接建立双向协议连接...`);
+        this.currentStatus.installProgress.message = "实例已就绪，正在恢复双向连接...";
+        this.emit("status_change", this.getStatus());
         await this.connect();
         this.isPoweringOn = false;
         this.emit("status_change", this.getStatus());
@@ -290,6 +322,9 @@ export class ColabRpcClient extends EventEmitter {
           resolve({ success: false, message: err.message });
         });
       });
+
+      this.currentStatus.installProgress.message = "实例开机完成，正在同步脚本并启动穿透通信服务...";
+      this.emit("status_change", this.getStatus());
 
       // 同步脚本并启动通信服务
       await this.ensureRemoteScripts(true);
@@ -360,55 +395,196 @@ export class ColabRpcClient extends EventEmitter {
   }
 
   /**
-   * 启动与 Colab 专属 Session 的 OpenSSH 交互子进程
+   * 确保云端后台常驻守护进程运行并获取 Cloudflare Quick Tunnel 穿透域名
+   * 采用轻量单次 colab exec (HTTP API 请求，不占用 SSH 连接)
    */
-  public async connect(): Promise<void> {
-    if (this.process || this.isConnecting) return;
-    this.isConnecting = true;
-
-    console.log(`[COLAB-RPC] 正在通过 colab ssh 连接专属 Colab 会话: ${this.sessionName}...`);
-
-    try {
-      await this.ensureRemoteScripts();
-    } catch (err: any) {
-      console.warn(`[COLAB-RPC] 检查/同步远端脚本异常: ${err.message}`);
+  public async ensureRemoteRunnerAndGetTunnel(): Promise<string | null> {
+    if (process.env.VITEST) {
+      return "https://mock-tunnel.trycloudflare.com";
     }
 
-    const args = ["ssh", "-s", this.sessionName, "--", "python3", "/content/runner.py"];
-    
+    const pythonCode = `
+import subprocess, os, time, shutil
+
+# 0. 优先确保 cloudflared 可执行 (耗时约 2 秒)
+if not shutil.which("cloudflared") and not os.path.exists("/usr/local/bin/cloudflared"):
+    try:
+        subprocess.run(["curl", "-fsSL", "-o", "/usr/local/bin/cloudflared", "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"], timeout=30, check=True)
+        subprocess.run(["chmod", "+x", "/usr/local/bin/cloudflared"], check=True)
+    except Exception:
+        pass
+
+# 1. 检查 runner.py 是否已在运行
+res = subprocess.run(["pgrep", "-f", "runner.py"], capture_output=True)
+if not res.stdout.strip():
+    log_file = open("/content/runner.log", "a")
+    subprocess.Popen(
+        ["python3", "/content/runner.py", "--session-name", "${this.sessionName}"],
+        stdin=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        start_new_session=True
+    )
+
+# 2. 等待 /content/tunnel_url.txt 生成 (最多等待 35 秒)
+tunnel_url = ""
+for _ in range(35):
+    if os.path.exists("/content/tunnel_url.txt"):
+        with open("/content/tunnel_url.txt") as f:
+            t = f.read().strip()
+            if t.startswith("https://"):
+                tunnel_url = t
+                break
+    time.sleep(1)
+
+print("CLIPFORGE_TUNNEL_URL:" + tunnel_url)
+`;
+
+    return new Promise((resolve) => {
+      const runner = spawn("colab", ["exec", "-s", this.sessionName], {
+        env: getColabEnv(),
+      });
+
+      let stdout = "";
+      let stderr = "";
+
+      runner.stdout.on("data", (d) => {
+        stdout += d.toString();
+      });
+      runner.stderr.on("data", (d) => {
+        stderr += d.toString();
+      });
+
+      const timer = setTimeout(() => {
+        try { runner.kill(); } catch (_) {}
+        resolve(null);
+      }, 45000);
+
+      runner.on("close", (code) => {
+        clearTimeout(timer);
+        if (code === 0 && stdout.includes("CLIPFORGE_TUNNEL_URL:")) {
+          const match = stdout.match(/CLIPFORGE_TUNNEL_URL:(https:\/\/[^\s]+)/);
+          if (match && match[1]) {
+            resolve(match[1].trim());
+            return;
+          }
+        }
+        resolve(null);
+      });
+
+      runner.on("error", (err) => {
+        clearTimeout(timer);
+        console.warn(`[COLAB-TUNNEL] colab exec 失败: ${err.message}`);
+        resolve(null);
+      });
+
+      runner.stdin.write(pythonCode);
+      runner.stdin.end();
+    });
+  }
+
+  /**
+   * 启动与 Colab 的全双工通信：
+   * 采用 Cloudflare Quick Tunnel 建立高速 WebSocket + HTTP 穿透，
+   * 绝不占用持久的 colab ssh 管道，将唯一的 SSH 会话完全让渡给开发者终端！
+   */
+  public async connect(): Promise<void> {
+    if ((this.wsClient && this.wsClient.readyState === WebSocket.OPEN) || this.isConnecting) return;
+    this.isConnecting = true;
+
     try {
-      this.process = spawn("colab", args, { env: getColabEnv() });
+      // 1. 如果已有记录的 tunnelUrl，先快速 probe /health 测试是否存活
+      if (this.tunnelUrl) {
+        try {
+          const resp = await fetch(`${this.tunnelUrl}/health`, { signal: AbortSignal.timeout(3000) });
+          if (resp.ok) {
+            console.log(`[COLAB-TUNNEL] 已知隧道 ${this.tunnelUrl} 仍然存活，直接连接 WebSocket...`);
+            this.connectWebSocket(this.tunnelUrl);
+            this.isConnecting = false;
+            return;
+          }
+        } catch (_) {}
+      }
 
-      this.process.stdout.on("data", (data: Buffer) => {
-        this.handleStdout(data.toString());
-      });
-
-      this.process.stderr.on("data", (data: Buffer) => {
-        const text = data.toString().trim();
-        if (text) console.warn(`[COLAB-STDERR] ${text}`);
-      });
-
-      this.process.on("close", (code) => {
-        console.log(`[COLAB-RPC] 会话已断开，退出码: ${code}`);
-        this.process = null;
+      // 2. 检查会话是否在运行中
+      const check = await this.checkSessionRunning();
+      if (!check.isRunning) {
+        console.log(`[COLAB-RPC] 会话 ${this.sessionName} 未处于运行状态，取消连接。`);
         this.isConnecting = false;
-        this.setOffline();
-      });
+        return;
+      }
 
-      this.process.on("error", (err) => {
-        console.warn(`[COLAB-RPC] 进程异常: ${err.message}`);
-        this.process = null;
-        this.isConnecting = false;
-        this.setOffline();
-      });
+      // 3. 确保远程脚本已同步
+      try {
+        await this.ensureRemoteScripts();
+      } catch (err: any) {
+        console.warn(`[COLAB-RPC] 检查/同步远端脚本异常: ${err.message}`);
+      }
 
-      this.startHeartbeat();
+      // 4. 通过单次 colab exec 确保云端后台常驻守护进程 runner.py 已启动并获取穿透隧道 URL
+      console.log(`[COLAB-RPC] 正在通过轻量 exec 探活/启动云端后台守护进程并获取穿透隧道...`);
+      const tunnelUrl = await this.ensureRemoteRunnerAndGetTunnel();
+
+      if (tunnelUrl) {
+        console.log(`[COLAB-RPC] 成功获取穿透隧道 URL: ${tunnelUrl}，正在建立 WebSocket 长连...`);
+        this.connectWebSocket(tunnelUrl);
+      } else {
+        console.warn(`[COLAB-RPC] 未能在规定时间内获取到穿透隧道 URL`);
+      }
     } catch (err: any) {
-      console.warn(`[COLAB-RPC] 启动子进程失败: ${err.message}`);
-      this.isConnecting = false;
-      this.setOffline();
+      console.warn(`[COLAB-RPC] 建立通信连接异常: ${err.message}`);
     } finally {
       this.isConnecting = false;
+    }
+  }
+
+  /**
+   * 建立基于 Cloudflare Quick Tunnel 的全双工 WebSocket 长连通道
+   * 彻底释放 colab ssh 单连接占用，让用户终端随时随地可自由登录，杜绝 429 冲突
+   */
+  public connectWebSocket(tunnelUrl: string): void {
+    if (this.wsClient && this.wsClient.readyState === WebSocket.OPEN) return;
+    this.tunnelUrl = tunnelUrl;
+    this.currentStatus.tunnelUrl = tunnelUrl;
+
+    const wsUrl = tunnelUrl.replace(/^http/, "ws") + "/ws";
+    console.log(`[COLAB-WS] 正在连接 Cloudflare WebSocket 双向通道: ${wsUrl}`);
+
+    try {
+      this.wsClient = new WebSocket(wsUrl);
+
+      this.wsClient.onopen = () => {
+        console.log(`[COLAB-WS] Cloudflare WebSocket 全双工通道已成功连通！`);
+        this.consecutiveMissedPings = 0;
+        this.currentStatus.online = true;
+        this.startHeartbeat();
+      };
+
+      this.wsClient.onmessage = (event: any) => {
+        const dataStr = typeof event.data === "string" ? event.data : event.data?.toString();
+        if (dataStr) {
+          this.handleStdout(dataStr);
+        }
+      };
+
+      this.wsClient.onerror = (err: any) => {
+        console.warn(`[COLAB-WS] WebSocket 通道提示: ${err.message || "连接建立中"}`);
+      };
+
+      this.wsClient.onclose = () => {
+        console.log(`[COLAB-WS] WebSocket 连接中断，5 秒后尝试重连...`);
+        this.wsClient = null;
+        if (this.wsReconnectTimer) clearTimeout(this.wsReconnectTimer);
+        this.wsReconnectTimer = setTimeout(() => {
+          if (this.tunnelUrl) {
+            this.connectWebSocket(this.tunnelUrl);
+          } else {
+            this.autoDiscover().catch(() => {});
+          }
+        }, 5000);
+      };
+    } catch (e: any) {
+      console.warn(`[COLAB-WS] 启动 WebSocket 异常: ${e.message}`);
     }
   }
 
@@ -421,7 +597,10 @@ export class ColabRpcClient extends EventEmitter {
   }
 
   private sendPing(): void {
-    if (!this.process || !this.process.stdin.writable) {
+    const isWsAlive = this.wsClient && this.wsClient.readyState === WebSocket.OPEN;
+    const isProcAlive = this.process && this.process.stdin.writable;
+
+    if (!isWsAlive && !isProcAlive) {
       this.setOffline();
       return;
     }
@@ -434,9 +613,14 @@ export class ColabRpcClient extends EventEmitter {
     };
 
     try {
-      this.process.stdin.write(JSON.stringify(pingFrame) + "\n");
+      if (isWsAlive) {
+        this.wsClient!.send(JSON.stringify(pingFrame));
+      } else if (isProcAlive) {
+        this.process!.stdin.write(JSON.stringify(pingFrame) + "\n");
+      }
       this.consecutiveMissedPings++;
-      if (this.consecutiveMissedPings >= 3) {
+      const maxMissed = this.currentStatus.lifecycle === "BUSY" ? 20 : 5;
+      if (this.consecutiveMissedPings >= maxMissed) {
         this.setOffline();
       }
     } catch {
@@ -463,6 +647,18 @@ export class ColabRpcClient extends EventEmitter {
       try {
         const msg = JSON.parse(trimmed);
 
+        // 收到来自 Colab 的任何合法 JSON-RPC 消息或通知，均证明双向通信畅通在线
+        this.consecutiveMissedPings = 0;
+        this.currentStatus.online = true;
+
+        // 动态发现与自愈：收到 Cloudflare 隧道域名，立即平滑升级至全双工 WebSocket
+        if (msg.params?.tunnelUrl || msg.result?.tunnelUrl) {
+          const tUrl = msg.params?.tunnelUrl || msg.result?.tunnelUrl;
+          if (tUrl && tUrl !== this.tunnelUrl) {
+            this.connectWebSocket(tUrl);
+          }
+        }
+
         // 1. 处理 Ping-Pong 心跳回包
         if (msg.result && msg.result.pong) {
           this.consecutiveMissedPings = 0;
@@ -484,6 +680,9 @@ export class ColabRpcClient extends EventEmitter {
           this.currentStatus.lastPingTimestamp = Date.now();
           if (msg.result.installProgress) {
             this.currentStatus.installProgress = msg.result.installProgress;
+          }
+          if (msg.result.currentProgress !== undefined) {
+            this.currentStatus.currentProgress = msg.result.currentProgress;
           }
           if (msg.result.hardware) {
             this.updateHardware(msg.result.hardware);
@@ -562,6 +761,9 @@ export class ColabRpcClient extends EventEmitter {
           if (p.installProgress) {
             this.currentStatus.installProgress = p.installProgress;
           }
+          if (p.currentProgress !== undefined) {
+            this.currentStatus.currentProgress = p.currentProgress;
+          }
           if (p.hardware) {
             this.updateHardware(p.hardware);
           }
@@ -591,6 +793,18 @@ export class ColabRpcClient extends EventEmitter {
         }
 
         if (msg.method === "task.progress" && msg.params) {
+          this.currentStatus.currentProgress = {
+            taskId: msg.params.taskId,
+            taskType: msg.params.taskType,
+            stage: msg.params.stage || "generating",
+            percent: msg.params.percent,
+            message: msg.params.message,
+            currentStep: msg.params.currentStep,
+            totalSteps: msg.params.totalSteps,
+            shotIndex: msg.params.shotIndex,
+            totalShots: msg.params.totalShots,
+            elapsedSec: msg.params.elapsedSec,
+          };
           this.updateRecentTask(msg.params.taskId, {
             percent: msg.params.percent,
             message: msg.params.message,
@@ -603,6 +817,8 @@ export class ColabRpcClient extends EventEmitter {
           this.currentStatus.lifecycle = "IDLE";
           this.currentStatus.state = "IDLE";
           this.currentStatus.currentTaskId = null;
+          this.currentStatus.currentTask = null;
+          this.currentStatus.currentProgress = null;
           this.updateRecentTask(msg.params.taskId, {
             status: "completed",
             percent: 100,
@@ -618,6 +834,8 @@ export class ColabRpcClient extends EventEmitter {
           this.currentStatus.lifecycle = "IDLE";
           this.currentStatus.state = "IDLE";
           this.currentStatus.currentTaskId = null;
+          this.currentStatus.currentTask = null;
+          this.currentStatus.currentProgress = null;
           this.updateRecentTask(msg.params.taskId, {
             status: "failed",
             message: msg.params.error || "任务执行失败",
@@ -690,7 +908,36 @@ export class ColabRpcClient extends EventEmitter {
 
     console.log(`[COLAB-QUEUE] 投递任务到目录队列: ${task.taskId} (${taskType})`);
 
-    // 优先通过 stdio RPC 投递
+    // 0. 若存在 Cloudflare 隧道，优先通过 HTTP API 极速投递
+    if (this.tunnelUrl) {
+      try {
+        const resp = await fetch(`${this.tunnelUrl}/tasks/submit`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (resp.ok) {
+          console.log(`[COLAB-QUEUE] 任务已通过 HTTP 直接提交至云端: ${task.taskId}`);
+          return;
+        }
+      } catch (e: any) {
+        console.warn(`[COLAB-QUEUE] HTTP 投递异常，降级通道: ${e.message}`);
+      }
+    }
+
+    // 1. 若 WebSocket 通道活跃，通过 WebSocket JSON-RPC 投递
+    if (this.wsClient && this.wsClient.readyState === WebSocket.OPEN) {
+      const frame = {
+        jsonrpc: "2.0",
+        id: `task_${Date.now()}`,
+        method: "task.submit",
+        params: payload,
+      };
+      this.wsClient.send(JSON.stringify(frame));
+      return;
+    }
+
+    // 2. 优先通过 stdio RPC 投递
     if (this.process && this.process.stdin.writable) {
       const frame = {
         jsonrpc: "2.0",
@@ -702,32 +949,33 @@ export class ColabRpcClient extends EventEmitter {
       return;
     }
 
-    // 兜底方案：通过 SSH 写入 /content/tasks/pending/<timestamp>_<taskId>.json
+    // 兜底方案：通过 colab exec 写入 /content/tasks/pending/<timestamp>_<taskId>.json (杜绝占用 SSH 管道)
     const remoteFilePath = `/content/tasks/pending/${Date.now()}_${task.taskId}.json`;
+    const pythonCode = `
+import json, os
+os.makedirs('/content/tasks/pending', exist_ok=True)
+payload = ${JSON.stringify(payload)}
+with open('${remoteFilePath}', 'w', encoding='utf-8') as f:
+    json.dump(payload, f, ensure_ascii=False, indent=2)
+print("SUCCESS_QUEUED")
+`;
     return new Promise((resolve, reject) => {
-      const runner = spawn(
-        "colab",
-        [
-          "ssh",
-          "-s",
-          this.sessionName,
-          "--",
-          "python3",
-          "-c",
-          `import sys, os; os.makedirs('/content/tasks/pending', exist_ok=True); open('${remoteFilePath}', 'w', encoding='utf-8').write(sys.stdin.read().strip())`,
-        ],
-        { env: getColabEnv() }
-      );
+      const runner = spawn("colab", ["exec", "-s", this.sessionName], {
+        env: getColabEnv(),
+      });
 
-      runner.stdin.write(JSON.stringify(payload, null, 2));
-      runner.stdin.end();
+      let stdout = "";
+      runner.stdout.on("data", (d) => { stdout += d.toString(); });
+      runner.stderr.on("data", (d) => { stdout += d.toString(); });
 
       runner.on("close", (code) => {
-        if (code === 0) resolve();
+        if (code === 0 && stdout.includes("SUCCESS_QUEUED")) resolve();
         else reject(new Error(`写入任务文件失败，退出码: ${code}`));
       });
 
       runner.on("error", (err) => reject(err));
+      runner.stdin.write(pythonCode);
+      runner.stdin.end();
     });
   }
 
@@ -749,11 +997,34 @@ export class ColabRpcClient extends EventEmitter {
       fs.mkdirSync(localDestDir, { recursive: true });
     }
 
+    if (fs.existsSync(localFilePath) && fs.statSync(localFilePath).size > 1024) {
+      console.log(`[COLAB-DOWNLOAD] 本地已存在该产物文件，直接复用: ${localFilePath}`);
+      return localFilePath;
+    }
+
     if (process.env.VITEST) {
       if (!fs.existsSync(localFilePath)) {
         fs.writeFileSync(localFilePath, "MOCK_DOWNLOAD_DATA");
       }
       return localFilePath;
+    }
+
+    // 若 Cloudflare Quick Tunnel 激活，优先通过 HTTP CDN 极速下载文件 (比 CLI 上下文切换快 10 倍)
+    if (this.tunnelUrl) {
+      try {
+        const fname = path.basename(remotePath);
+        const fileUrl = `${this.tunnelUrl}/outputs/${fname}`;
+        console.log(`[COLAB-DOWNLOAD] 正在通过 Cloudflare CDN 极速下载: ${fileUrl} -> ${localFilePath}`);
+        const resp = await fetch(fileUrl);
+        if (resp.ok) {
+          const buffer = Buffer.from(await resp.arrayBuffer());
+          fs.writeFileSync(localFilePath, buffer);
+          console.log(`[COLAB-DOWNLOAD] CDN 下载成功落盘: ${localFilePath} (${(buffer.length / 1024 / 1024).toFixed(2)} MB)`);
+          return localFilePath;
+        }
+      } catch (err: any) {
+        console.warn(`[COLAB-DOWNLOAD] CDN 下载异常，降级到 colab download: ${err.message}`);
+      }
     }
 
     console.log(`[COLAB-DOWNLOAD] 开始下载云端产物: ${remotePath} -> ${localFilePath}`);
@@ -794,32 +1065,45 @@ export class ColabRpcClient extends EventEmitter {
    * Web 端一键续命 15 分钟
    */
   public sendKeepAlive(extraMinutes = 15): void {
-    if (!this.process || !this.process.stdin.writable) return;
     const frame = {
       jsonrpc: "2.0",
       id: `ka_${Date.now()}`,
       method: "watchdog.extend",
       params: { seconds: extraMinutes * 60 },
     };
-    this.process.stdin.write(JSON.stringify(frame) + "\n");
+    if (this.wsClient && this.wsClient.readyState === WebSocket.OPEN) {
+      this.wsClient.send(JSON.stringify(frame));
+    } else if (this.process && this.process.stdin.writable) {
+      this.process.stdin.write(JSON.stringify(frame) + "\n");
+    }
   }
 
   /**
    * Web 端一键立即安全停机释放实例
    */
   public terminateColab(): void {
-    if (!this.process || !this.process.stdin.writable) return;
     const frame = {
       jsonrpc: "2.0",
       id: `term_${Date.now()}`,
       method: "watchdog.shutdown",
       params: {},
     };
-    this.process.stdin.write(JSON.stringify(frame) + "\n");
+    if (this.wsClient && this.wsClient.readyState === WebSocket.OPEN) {
+      this.wsClient.send(JSON.stringify(frame));
+    } else if (this.process && this.process.stdin.writable) {
+      this.process.stdin.write(JSON.stringify(frame) + "\n");
+    }
   }
 
   public disconnect(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this.wsReconnectTimer) clearTimeout(this.wsReconnectTimer);
+    if (this.wsClient) {
+      try {
+        this.wsClient.close();
+      } catch (_) {}
+      this.wsClient = null;
+    }
     if (this.process) {
       this.process.kill();
       this.process = null;

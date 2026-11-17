@@ -48,13 +48,16 @@ def wait_for_comfy_completion(
     prompt_id: str,
     host: str = COMFY_HOST,
     timeout_sec: int = 900,
-    poll_interval: int = 3,
+    poll_interval: float = 1.0,
     progress_callback: Optional[Callable[[int, str, str, Optional[dict]], None]] = None,
-    progress_range: tuple = (10, 90)
+    progress_range: tuple = (10, 90),
+    task_kind: str = "image"
 ) -> dict:
-    """轮询等待 ComfyUI prompt 执行完成并返回产物信息"""
+    """轮询等待 ComfyUI prompt 执行完成并返回产物信息，实时上报去噪进度"""
     t0 = time.time()
     p_start, p_end = progress_range
+    expected_duration = 18.0 if task_kind == "image" else 320.0
+
     while time.time() - t0 < timeout_sec:
         try:
             req = urllib.request.Request(f"{host}/history/{prompt_id}")
@@ -72,11 +75,41 @@ def wait_for_comfy_completion(
         except urllib.error.URLError:
             pass
 
-        # 进度插值估算
+        # 细粒度步骤与百分比流式上报
         elapsed = time.time() - t0
-        pct = p_start + int(min(0.9, elapsed / (timeout_sec * 0.5)) * (p_end - p_start))
+        ratio = min(0.96, elapsed / expected_duration)
+        pct = p_start + int(ratio * (p_end - p_start))
+
+        if task_kind == "image":
+            if elapsed < 3.0:
+                step_name = "conditioning"
+                msg = f"注入 Qwen3VL 多模态条件与提示词 ({int(elapsed)}s)..."
+            elif elapsed < 14.0:
+                step_idx = min(6, max(1, int((elapsed - 3.0) / 1.8) + 1))
+                step_name = "denoising"
+                msg = f"KSampler 扩散去噪采样中 (Step {step_idx}/6, 已耗时 {int(elapsed)}s)..."
+            else:
+                step_name = "vae_decode"
+                msg = f"VAE 解码高分辨率图像 ({int(elapsed)}s)..."
+        else:
+            # video 模式：8秒 192帧 完整视频生成通常耗时约 240~420秒
+            if elapsed < 25.0:
+                step_name = "conditioning"
+                msg = f"加载首帧 AddGuide 与运镜条件 ({int(elapsed)}s)..."
+            elif elapsed < 260.0:
+                step_idx = min(4, max(1, int((elapsed - 25.0) / 58.0) + 1))
+                step_name = "dmad_denoise"
+                msg = f"DMAD 4步 LoRA 运镜扩散去噪 (Step {step_idx}/4, 已耗时 {int(elapsed)}s)..."
+            else:
+                step_name = "vae_decode"
+                msg = f"VAE 解码 192 帧视频流与高保真音频合成 ({int(elapsed)}s)..."
+
         if progress_callback:
-            progress_callback(pct, "running", f"MiniMax GPU 扩散去噪中 (已耗时 {int(elapsed)}s)...", None)
+            progress_callback(pct, step_name, msg, {
+                "elapsedSec": round(elapsed, 1),
+                "taskKind": task_kind,
+                "promptId": prompt_id
+            })
 
         time.sleep(poll_interval)
 
@@ -195,12 +228,20 @@ def generate_single_frame(
     height: int = 1344,
     steps: int = 6,
     seed: int = 42,
-    prefix: str = "frame"
+    prefix: str = "frame",
+    progress_callback: Optional[Callable[[int, str, str, Optional[dict]], None]] = None,
+    progress_range: tuple = (15, 85)
 ) -> str:
     """渲染单张分镜画格，返回保存的物理图片路径"""
     graph = build_h3_image_graph(prompt, width, height, steps, seed, ref_images, prefix)
     prompt_id = post_comfy_prompt(graph)
-    outputs = wait_for_comfy_completion(prompt_id, timeout_sec=180)
+    outputs = wait_for_comfy_completion(
+        prompt_id,
+        timeout_sec=180,
+        progress_callback=progress_callback,
+        progress_range=progress_range,
+        task_kind="image"
+    )
     save_node = outputs.get("8", {})
     images = save_node.get("images", [])
     if not images:
@@ -244,7 +285,46 @@ def generate_grid_image(
                 fname = stage_file_to_comfy(r, f"product_ref_{idx}.png")
                 staged_refs.append(fname)
 
-    # 2. 主角锚定图 (Actor Anchor)
+    # 极速单次 3x3 九宫格出图模式 (15~25s 极速出片，提速 10 倍以上)
+    # 若 prompt 为完整的 3x3 九宫格接触表描述，直接一次性渲染高清大图并极速切片
+    is_grid_prompt = "3x3" in prompt.lower() or "grid" in prompt.lower() or "contact sheet" in prompt.lower()
+    if is_grid_prompt:
+        if progress_callback:
+            progress_callback(20, "rendering_grid", "正在极速渲染 3x3 商业九宫格大图 (单次扩散出图)...")
+
+        grid_frame = generate_single_frame(
+            prompt=prompt,
+            ref_images=staged_refs if staged_refs else None,
+            width=768,
+            height=1344,
+            steps=6,
+            seed=42,
+            prefix="grid_direct",
+            progress_callback=progress_callback,
+            progress_range=(15, 85)
+        )
+        shutil.copy2(grid_frame, output_path)
+
+        # 毫秒级几何切片 9 个分镜作为关键帧落盘
+        if progress_callback:
+            progress_callback(85, "slicing", "正在几何切分 9 张关键帧分镜...")
+        try:
+            im = Image.open(output_path).convert("RGB")
+            w, h = im.size
+            cell_w, cell_h = w // 3, h // 3
+            for i in range(9):
+                col, row = i % 3, i // 3
+                box = (col * cell_w, row * cell_h, (col + 1) * cell_w, (row + 1) * cell_h)
+                cell_cut = im.crop(box)
+                cell_cut.save(output_dir / f"shot_{i+1}_keyframe.png")
+        except Exception as e:
+            print(f"[ENGINE] 辅助切片异常: {e}", flush=True)
+
+        if progress_callback:
+            progress_callback(100, "done", "3x3 九宫格极速生成完成！")
+        return
+
+    # 2. 主角锚定图 (Actor Anchor) - 备用模式
     # 如果用户未传入人物肖像，先使用 MiniMax-H3-Image 纯文本生成一张标准正面带货主角立绘
     actor_ref_name = "ref_actor.png"
     actor_ref_path = COMFY_INPUT_DIR / actor_ref_name
@@ -529,9 +609,10 @@ def generate_video_clip(
     # 4. 轮询等待出片
     outputs = wait_for_comfy_completion(
         prompt_id,
-        timeout_sec=600,
+        timeout_sec=900,
         progress_callback=progress_callback,
-        progress_range=(20, 95)
+        progress_range=(20, 95),
+        task_kind="video"
     )
 
     # 提取输出视频

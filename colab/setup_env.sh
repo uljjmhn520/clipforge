@@ -19,18 +19,24 @@ mkdir -p "${MODELS_DIR}/diffusion_models" \
          "/content/tasks/failed" \
          "${WORKSPACE}/outputs"
 
-echo ">>> [STAGE:SYS_DEPS] 安装系统级依赖 (ffmpeg, aria2, git-lfs)..."
+echo ">>> [STAGE:SYS_DEPS] 安装系统级依赖 (ffmpeg, aria2, git-lfs, cloudflared)..."
 apt-get update -qq && apt-get install -y -qq ffmpeg aria2 git-lfs > /dev/null
+
+if ! command -v cloudflared &> /dev/null; then
+    echo ">>> [STAGE:SYS_DEPS] 安装 Cloudflare Tunnel (cloudflared)..."
+    aria2c -c -x 4 -s 4 --console-log-level=warn "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" -d /usr/local/bin -o cloudflared
+    chmod +x /usr/local/bin/cloudflared
+fi
 
 if [ ! -d "${COMFY_DIR}" ]; then
     echo ">>> [STAGE:COMFY_CLONE] 克隆 ComfyUI 官方仓库..."
     git clone -q --depth 1 https://github.com/comfyanonymous/ComfyUI "${COMFY_DIR}"
 fi
 
-echo ">>> [STAGE:COMFY_DEPS] 安装 Python 运行环境与 Comfy 扩展库..."
+echo ">>> [STAGE:COMFY_DEPS] 安装 Python 运行环境与 Comfy/FastAPI 扩展库..."
 pip install -q uv
 grep -viE '^(torch|torchvision|torchaudio)([=<> ]|$)' "${COMFY_DIR}/requirements.txt" > /tmp/req_comfy.txt
-uv pip install --system -q -r /tmp/req_comfy.txt "comfy-kitchen>=0.2.41" "comfy-aimdo>=0.6.0" huggingface_hub
+uv pip install --system -q -r /tmp/req_comfy.txt "comfy-kitchen>=0.2.41" "comfy-aimdo>=0.6.0" huggingface_hub fastapi "uvicorn[standard]" websockets
 
 # 绑定 extra_model_paths.yaml
 cat <<EOF > "${COMFY_DIR}/extra_model_paths.yaml"
