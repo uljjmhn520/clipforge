@@ -1,6 +1,6 @@
-# 核心系统模块拆解与接口设计规范 (v2.6 OpenSSH 隧道与无侵入环境定案版)
+# 核心系统模块拆解与接口设计规范 (v3.0 目录队列与独立监控看板版)
 
-本文档将系统拆解为 **6 个高内聚、低耦合的内部模块** 与 **1 个独立的 Colab 云端协议运行器**，明确各模块的职责边界、输入输出契约、基于 OpenSSH 隧道 (`colab ssh`) 的非阻塞通信与 Append-Only 高容错任务队列、以及基于 stdio 的 JSON-RPC 心跳机制。
+本文档将系统拆解为 **6 个高内聚、低耦合的内部模块** 与 **1 个独立的 Colab 云端协议运行器**，明确各模块的职责边界、输入输出契约、基于 OpenSSH 隧道 (`colab ssh`) 的非阻塞通信与 `/content/tasks/pending/` 目录文件队列、高频轮询状态快照同步机制，以及本地独立监控看板 (`/colab`)。
 
 ---
 
@@ -10,114 +10,121 @@
 
 ```
 clipforge/
-├── colab/                          # 【云端运行脚本】运行于 Colab A100/L4 实例
-│   ├── bootstrap.py                # 阶段 1 启动看门狗 (15分钟) + Google Drive 自动挂载
-│   ├── runner.py                   # 阶段 2 执行器 (文件队列消费 + stdio 心跳 + 5分钟看门狗)
+├── colab/                          # 【云端运行脚本】运行于 Colab L4/A100 实例
+│   ├── clipforge_colab.ipynb       # 规范化 Colab 笔记本 (一键启动极速握手与受控安装)
+│   ├── setup_env.sh                # 依赖与 ComfyUI / MiniMax 权重多线程拉取脚本
+│   ├── runner.py                   # 核心协议守护进程 (秒级启动、后台流式安装、目录任务扫描、看门狗)
 │   └── minimax_engine.py           # MiniMax-H3 / MiniMax-H3-Image 显存加载与推理
 ├── src/
 │   ├── app/                        # 【Web 交互层】Next.js App Router (UI 与 API Routes)
-│   │   ├── api/                    # 纯净 API 接口层 (亦可直接对外暴露为 MCP Tools)
+│   │   ├── colab/                  # 【全新】Colab 独立全功能监控看板页面
+│   │   │   └── page.tsx            # (全流程树、硬件仪表盘、队列卡片、看门狗控制)
+│   │   ├── api/                    # API 接口层
+│   │   │   ├── projects/route.ts   # 项目全量列表概览 (含音画资产探测) & 批量彻底删除 (级联清理)
 │   │   │   ├── brain/              # 脚本与模型 API (Gemini 动态列表/生成/质检)
 │   │   │   ├── storyboard/         # 九宫格处理 (切片/单格替换/审核通过/MiniMax云端直出)
-│   │   │   ├── colab/              # Colab 专属 Session 会话控制与批量提交 (开机/SSH隧道/心跳)
-│   │   │   ├── audio/              # 配音与语音转写 (CosyVoice/Whisper)
+│   │   │   ├── colab/              # Colab 会话控制与状态接口
+│   │   │   │   ├── status/route.ts # 高频 Polling 状态聚合端点 (内存快照)
+│   │   │   │   ├── submit/route.ts # 目录队列任务下发接口 (支持单分镜增量)
+│   │   │   │   └── redo-shot/      # 单分镜就地重渲与图片重做端点
+│   │   │   ├── audio/              # 配音与语音转写 (Edge-TTS / Whisper)
 │   │   │   └── compose/            # 最终混音渲染与多格式导出
-│   │   └── (dashboard)/            # 现代化前端界面 (新建/脚本审片/九宫格审核台/Colab实时监控/作品瀑布流)
+│   │   └── page.tsx                # 双视图全功能控制台 (制作工作台 + 视频进度列表卡片流及内嵌资产面板)
 │   ├── lib/
 │   │   ├── db/                     # 【持久化层】Drizzle ORM + SQLite
 │   │   │   ├── schema.ts           # 核心表结构定义 (包含强只读锁定状态机)
 │   │   │   └── index.ts
 │   │   └── modules/                # 【核心业务逻辑层】6 大功能子系统
-│   │       ├── brain/              # 模块 1：创意与判官大脑
+│   │       ├── brain/              # 模块 1：创意与判官大脑 (Gemini API)
 │   │       ├── storyboard/         # 模块 2：九宫格几何切片与外部提示词导出
-│   │       ├── colab-rpc/          # 模块 3：基于 OpenSSH 隧道 (colab ssh) 与文件队列的容错客户端
-│   │       ├── audio/              # 模块 4：商业合规配音与时间戳对齐引擎
+│   │       ├── colab-rpc/          # 模块 3：OpenSSH 隧道客户端与目录队列调度器
+│   │       ├── audio/              # 模块 4：Edge-TTS 高保真配音与时间戳对齐引擎
 │   │       ├── composer/           # 模块 5：FFmpeg NVENC 硬件压制与字幕混音引擎
 │   │       └── state-machine/      # 模块 6：任务全生命周期调度与只读锁
-├── assets/
-│   └── fonts/                      # 100% 商业安全字体库 (思源黑体、阿里普惠体)
-├── docs/                           # 架构与开发规范文档库
-└── temp/from_src/                  # 原项目备份代码库
+│   └── ...
 ```
 
 ---
 
-## 二、 OpenSSH 隧道与文件持久化队列机制 (`modules/colab-rpc/`)
-
-为避免原 `colab exec` 命令因同步阻塞导致的调用端进程锁死与偶发网络中断痛点，系统全面换用 **`colab ssh`** 作为底层传输通道，并配合 **“基于文件的 Append-Only 持久化任务日志队列”**：
+## 二、 Colab 通信与目录任务队列机制 (`modules/colab-rpc/`)
 
 ```
-[本地 Node.js 客户端]                                 [云端 Colab L4/A100 实例]
+[本地 Node.js 客户端]                                 [云端 Colab L4 实例]
         │                                                         │
-        │ 1. 任务推送 (通过 colab ssh 独立追加写入临时文件)        │
-        ├────────────────────────────────────────────────────────►│  追加写入: /content/inbox.jsonl
+        │ 1. 建立 OpenSSH 隧道长连接 (colab ssh -s <session>)      │
+        ├────────────────────────────────────────────────────────►│  秒级启动 runner.py
+        │◄────────────────────────────────────────────────────────┤  回传 [HANDSHAKE_READY]
+        │                                                         │
+        │ 2. 云端受控后台安装 ComfyUI + MiniMax 权重              │
+        │◄─── 每秒流式回传下载进度、网络速度、硬件负载 ─────────────┤  多线程 aria2 下载至 /content/models/
+        │                                                         │
+        │ 3. 投递任务包至目录队列                                  │
+        ├────────────────────────────────────────────────────────►│  写入 /content/tasks/pending/<id>/task.json
         │                                                         │         │
         │                                                         │         ▼
-        │                                                         │  [runner.py 逐行消费游标]
-        │                                                         │         │ 正在推理生成...
-        │                                                         │         ▼
-        │                                                         │  视频/图片写入 Google Drive
-        │                                                         │  结果写入: /content/outbox.jsonl
+        │                                                         │  [按时间戳顺序轮询消费]
+        │                                                         │  状态: running -> completed
+        │                                                         │  执行 MiniMax 文生图 / 图生视频
         │                                                         │         │
-        │ 2. 重连后自动补录 / 正常 SSH 流式回传                   │         ▼
-        │◄────────────────────────────────────────────────────────┤  从 /content/outbox.jsonl 回传回执
-        │                                                         │
+        │                                                         │         ▼
+        │ 4. 结果回传与状态同步                                    │  任务移入 /content/tasks/completed/<id>/
+        │◄────────────────────────────────────────────────────────┤  成片直存 Google Drive 并回传元数据
 ```
 
-### 1. 方案 A：子进程运行时环境注入 (getColabEnv)
-* **OpenSSH ProxyCommand 适配**：`colab ssh` 启动时，SSH 客户端通过 ProxyCommand 命令调用 `/usr/bin/python3 -m colab_cli.cli`。
-* **无侵入运行时注入**：在 Node.js 中通过 `getColabEnv()`：
-  1. 确保 `PATH` 包含 `~/.local/bin`；
-  2. 动态读取 `~/.cache/uv/archive-v0/` 下全部子目录，拼接为 `PYTHONPATH` 传入派生子进程；
-  3. **效果**：系统级 `/usr/bin/python3` 无需修改全局环境即能定位 `colab_cli`，彻底避免影响宿主机上其他并行运行的 Colab 会话。
-
-### 2. 队列文件与并发机制（轻量高效，位于 Colab 实例磁盘 `/content/`）
-* **任务收件箱**：`/content/inbox.jsonl`
-  * 每当下发新分镜生成任务，本地通过独立的 SSH 命令 `colab ssh -s <session> -- "echo '...' >> /content/inbox.jsonl"` 追加写入；
-  * 该命令在独立的 SSH 进程中瞬间完成退出，**绝不阻塞主心跳管道**；
-  * 任务落入 Colab 磁盘，即使本地断网，云端任务绝不丢失。
-* **结果发件箱**：`/content/outbox.jsonl`
-  * Colab 渲染完成一个分镜后，将生成的视频路径及耗时信息追加一行到 `outbox.jsonl`；
-  * 同时通过长连接 SSH 的 `stdout` 进行常规事件通知；
-* **断线重连补录机制 (Resilient Reconnect)**：
-  * 若中间网络断连，本地重连后调用 `sync_outbox` 或通过 SSH 读取上次已知游标之后的所有 `outbox.jsonl` 记录；
-  * 本地 SQLite 状态机平滑完成补录，**无需重复渲染，零重复计费，零丢单**。
-
-### 3. 超时与心跳参数（本地 `.env` 完全掌控）
-```ini
-# --- colab ssh 执行与心跳参数 ---
-COLAB_SESSION_NAME="clipforge_helloworld1234"
-
-# 单次交互/命令最大超时时间（秒），默认 600 秒（10分钟）
-COLAB_EXEC_TIMEOUT_SECONDS=600
-
-# 本地向 Colab 探测心跳的周期（秒），默认 15 秒
-COLAB_HEARTBEAT_INTERVAL_SECONDS=15
+### 1. 目录任务包协议格式 (`/content/tasks/pending/<timestamp>_<taskId>/task.json`)
+```json
+{
+  "taskId": "task_1710500123_proj01_shot1",
+  "projectId": "proj01",
+  "taskType": "video_gen", // "image_grid_gen" | "video_gen"
+  "createdAt": 1710500123,
+  "params": {
+    "prompt": "女主播微笑着看向镜头，右手举起产品，轻微点头",
+    "keyframeImage": "input_frame.png", // 同目录下存有图片
+    "durationSec": 4.0,
+    "steps": 4,
+    "use4StepLora": true
+  },
+  "driveOutputDir": "/content/drive/MyDrive/ClipForge/outputs/proj01"
+}
 ```
 
-### 4. 本地主动 Ping-Pong 轮询心跳协议
-本地由独立计时器每隔 15 秒向 `colab ssh -s <session> -- python3 /content/runner.py` 子进程 `stdin` 发送心跳帧，Colab 立即通过 `stdout` 响应：
-
-* **本地 -> Colab (Ping 帧)**：
-  ```json
-  { "jsonrpc": "2.0", "id": "hb_1001", "method": "heartbeat.ping", "params": { "timestamp": 1710500000 } }
-  ```
-* **Colab -> 本地 (Pong 回包)**：
-  ```json
-  {
-    "jsonrpc": "2.0",
-    "id": "hb_1001",
-    "result": {
-      "pong": true,
-      "state": "IDLE",                 // 当前状态："IDLE" (空闲) | "BUSY" (正在推理)
-      "current_task_id": null,         // 当前任务 ID (若有)
-      "last_processed_line": 4,        // inbox.jsonl 已处理到的行号
-      "gpu_memory_used_mb": 14208,     // 当前显存占用 (MB)
-      "gpu_memory_total_mb": 22937,    // 显存总量 (MB)
-      "idle_seconds_left": 285         // 看门狗归零关机剩余秒数 (BUSY 时为 -1)
-    }
-  }
-  ```
+### 2. 状态机响应格式 (RPC 回传与本地缓存)
+本地 Node.js 维护单例 `ColabStateStore`，响应前端高频轮询 (`/api/colab/status`)：
+```typescript
+interface ColabStatusResponse {
+  connected: boolean;
+  sessionName: string;
+  lifecycleStage: "INIT_BOOT" | "RPC_READY" | "INSTALLING_MODELS" | "IDLE" | "BUSY" | "OFFLINE";
+  installProgress: {
+    stage: string;
+    percent: number;
+    speedMbps: number;
+    logTail: string[];
+  };
+  hardware: {
+    cpuPercent: number;
+    cpuNote: string; // "处于 GPU 推理/下载中，CPU 占用偏低属正常"
+    ramUsedMb: number;
+    ramTotalMb: number;
+    gpuName: string;
+    gpuUtilPercent: number;
+    vramUsedMb: number;
+    vramTotalMb: number;
+  };
+  tasks: {
+    current: TaskSummary | null;
+    pendingCount: number;
+    pendingList: TaskSummary[];
+    completedList: TaskSummary[];
+  };
+  watchdog: {
+    idleSecondsLeft: number;
+    maxLifetimeLeft: number;
+    isBusyFrozen: boolean;
+  };
+}
+```
 
 ---
 
@@ -125,46 +132,56 @@ COLAB_HEARTBEAT_INTERVAL_SECONDS=15
 
 ### 模块 1：创意与判官大脑 (`src/lib/modules/brain/`)
 * **职责**：
-  1. 动态获取 Google AI Studio 的可用模型列表（优先默认推荐 `gemini-3.8-flash`）；
+  1. 调用 Google AI Studio `client.models.list()` 动态枚举最新模型（默认推荐 `gemini-3.5-flash` / `gemini-3.8-flash`）；
   2. 接收商品实拍图，提取核心卖点与痛点；
   3. 生成结构化 JSON 分镜初稿；
-  4. 执行五判官（节奏/口语/创意/结构/画面）对抗质检与等长重写；
-  5. 广告法违禁极限词静态扫描与替换。
+  4. 五判官对抗质检与等长重写，违禁词过滤；
+  5. 输出优化后的 MiniMax-H3-Image 提示词。
 
 ### 模块 2：九宫格分镜与切片引擎 (`src/lib/modules/storyboard/`)
 * **职责**：
-  1. 针对 Google Flow / Midjourney / FLUX 导出高度优化的 3×3 九宫格生成 Prompt；
-  2. 接收用户上传或云端回传的 9:16 大图，使用 `sharp` 等分裁切为 9 张独立 9:16 关键帧；
-  3. 支持关键帧审查工作台的“单格替换”逻辑；
-  4. 触发“人工审核确认通过”，解锁向云端下发任务的权限。
+  1. 组织 3×3 九宫格生成 Prompt；
+  2. 接收由 Colab MiniMax-H3-Image 或外部生成的 9:16 大图，使用 `sharp` 等分裁切为 9 张独立 9:16 关键帧；
+  3. 审查工作台的“单格替换”与“人工审核通过”放行门禁。
 
-### 模块 3：Colab OpenSSH 通道与断线重连客户端 (`src/lib/modules/colab-rpc/`)
+### 模块 3：Colab OpenSSH 通道与目录队列客户端 (`src/lib/modules/colab-rpc/`)
 * **职责**：
-  1. 采用 OpenSSH 隧道 (`colab ssh`) 建立与 Colab 会话的稳定非阻塞连接；
-  2. 实现方案 A 运行时环境注入 (`getColabEnv`)，自动补齐 uv 归档依赖至 `PYTHONPATH`，杜绝代理子进程 ModuleNotFoundError；
-  3. 封装向 Colab `/content/inbox.jsonl` 的并发非阻塞追加任务写入逻辑；
-  4. 维护已接收结果的行号游标，断线重连时自动从 `/content/outbox.jsonl` 追溯补偿未确认的结果；
-  5. 启动并维护 `heartbeat.ping` 周期探测定时器，更新系统心跳健康表；
-  6. 提供 `execCommand` 接口执行任意非阻塞远端命令及状态巡检；
-  7. 接收 Google Drive 文件落盘路径，回传本地更新 SQLite 并通过 `colab download` 自动落盘。
+  1. 采用 OpenSSH 隧道 (`colab ssh`) 建立与 Colab 会话的非阻塞稳定管道；
+  2. 方案 A 运行时环境注入 (`getColabEnv`)，自动补齐 uv 依赖至 `PYTHONPATH`；
+  3. 任务打包推送到 `/content/tasks/pending/`；
+  4. **断线自动补偿机制**：重新建立连接时，Colab 立即上报 `/content/tasks/completed/` 历史收据，本地对比数据库自动补录并拉取成片；
+  5. **显存 OOM 智能自愈与重试 1 次**：云端遇到 CUDA OOM 或推理异常时，自动清空 PyTorch CUDA 缓存并重启 ComfyUI 后自动重试 1 次，再次失败归档至 `failed/` 并通知本地，不阻断主队列；
+  6. 维护本地内存快照，收集安装进度、硬件指标与看门狗状态，向前端 `/colab` 提供 1~2s 短轮询数据；
+  7. 响应续命、关机、取消任务等控制指令。
 
-### 模块 4：商业配音与时间戳对齐引擎 (`src/lib/modules/audio/`)
+### 模块 4：Edge-TTS 高保真配音与时间戳对齐引擎 (`src/lib/modules/audio/`)
 * **职责**：
-  1. 对接 CosyVoice 2 官方商业 API（或本地 T4 伴生推理端点），生成无杂音解说音频；
-  2. 调用 Faster-Whisper 抽取单字毫秒级起止时间戳，计算卡拉OK高亮数据结构；
-  3. 组装 **Voice Grounding** 滤镜：90Hz 高通 + 9500Hz 低通 + 3:1 动态压缩 + 混入合成低频布朗房间底噪。
+  1. 基于微软 Edge-TTS 原生协议生成自然流畅的解说音频（零成本、免授权、开箱即用）；
+  2. **内置电商爆款预设音色库**：
+     - `zh-CN-XiaoxiaoNeural`（晓晓 - 热情亲切带货女声，默认首选）
+     - `zh-CN-YunxiNeural`（云希 - 阳光自然解说男声）
+     - `zh-CN-YunjianNeural`（云健 - 专业沉稳影视解说男声）
+     - `zh-CN-XiaoyiNeural`（晓伊 - 活泼灵动电商女声）
+  3. **紧凑电商语速微调**：默认预设 `rate="+15%"`（节奏紧凑不拖沓），输出带起止时间戳的 VTT 歌词字幕；
+  4. 组装 Voice Grounding 模拟真实手机收音（90Hz高通 + 9500Hz低通 + 动态压缩 + 环境底噪混音）。
 
 ### 模块 5：FFmpeg NVENC 硬件压制与字幕合成引擎 (`src/lib/modules/composer/`)
 * **职责**：
-  1. 流规范化滤镜链构建（统一 `yuv420p,setsar=1,fps=30,settb=AVTB`）；
-  2. 启用 Tesla T4 专用的 `h264_nvenc` 进行硬件加速渲染；
-  3. 绑定物理路径中的思源黑体（`SourceHanSansCN-Bold.otf`），利用 `drawtext` 烧录卡拉OK逐字字幕与价格标签；
-  4. 视频前 3 秒右上角固定打上“**本视频由 AI 辅助生成**”合规角标；
-  5. 全片 EBU R128 响度标准化。
+  1. 流规范化统一滤镜（`yuv420p,setsar=1,fps=30`）；
+  2. Tesla T4 专用的 `h264_nvenc` 硬件压制；
+  3. 绑定思源黑体烧录卡拉OK高亮字幕，打上“本视频由 AI 辅助生成”合规角标与商品标签；
+  4. EBU R128 音频标准化。
 
 ### 模块 6：任务全生命周期调度与只读锁 (`src/lib/modules/state-machine/`)
 * **职责**：
-  1. 基于 Drizzle + SQLite 实现状态跃迁与悲观锁机制；
-  2. 状态严格流转：
-     `draft` → `grid_reviewing` → **`grid_approved`** → `cloud_queued` → **`🔒cloud_running (前端加锁置灰)`** → `cloud_done` → `completed`；
-  3. 门禁检查：未经过人工 `grid_approved` 的任务绝不下发云端；已在 `cloud_running` 的任务拒绝任何修改。
+  1. 基于 Drizzle + SQLite 严格维护任务状态跃迁与悲观锁；
+  2. 状态流：`draft` → `grid_reviewing` → `grid_approved` → `cloud_queued` → `cloud_running (locked)` → `cloud_done` → `completed`；
+  3. **单分镜增量失效与重渲**：支持单独传入 `targetShotId` 将指定单分镜推入云端重新渲染，其余已渲染完成的分镜绝对保留，极大节约算力与时间；
+  4. 门禁检查：未人工审核禁止下发云端；云端运行中禁止任何修改。
+
+### 模块 7：本地目录任务队列消费与重生成调度器 (`src/lib/modules/state-machine/local-dispatcher.ts`)
+* **职责**：
+  1. **本地任务目录管理**：维护 `data/local_tasks/pending/`、`dispatched/`、`failed/` 三级文件队列；
+  2. **离线任务暂存 (Offline Queuing)**：用户在“五判官质检报告”点击自动生图或在审核后提交视频生成时，无论 Colab 是否开机，先在本地 `pending/` 目录完成原子入队，DB 标记为 `waiting_for_cloud`；
+  3. **双向通信开机消费 (Online Auto-Dispatch)**：监听 Colab 双向通信握手就绪（`handshake_ready` / `env_ready`）及周期巡检，**仅当 Colab 已开机且通信正常**时，将任务按时间戳顺序上传分发至云端 `/content/tasks/pending/`，分发成功移至 `dispatched/`；
+  4. **防卡死任务重生成 (Task Re-generation)**：暴露 `resubmitProjectTasks` 接口与前端操作，支持一键清洗旧待办、重新组装最新任务入队。

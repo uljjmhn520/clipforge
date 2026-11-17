@@ -15,7 +15,7 @@ export async function POST(req: Request) {
     return NextResponse.json({
       success: true,
       taskId: task.id,
-      message: "MiniMax-H3-Image 九宫格生成任务已下发至云端队列！Colab 就绪后将自动生成并切片。",
+      message: "MiniMax-H3-Image 九宫格生图任务已生成并存入本地队列！Colab 云端开机握手就绪后将自动消费上传。",
     });
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 });

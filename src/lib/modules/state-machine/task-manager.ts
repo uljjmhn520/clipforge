@@ -2,6 +2,7 @@ import { db } from "@/lib/db";
 import { projects, scripts, cloudTasks, compositions, Shot } from "@/lib/db/schema";
 import { eq, and, gt } from "drizzle-orm";
 import { colabClient } from "../colab-rpc/client";
+import { localTaskDispatcher } from "./local-dispatcher";
 import { slice3x3GridImage } from "../storyboard/slicer";
 import { join } from "path";
 import { existsSync, readFileSync } from "fs";
@@ -130,39 +131,41 @@ export class TaskManager {
       projectId,
       shotId: 0, // shotId 0 标记为九宫格大图任务
       sessionName: session,
-      state: "submitted_to_inbox",
+      state: "waiting_for_cloud",
       isLocked: false,
       driveOutputPath,
     }).returning();
 
-    // 更新项目状态为 grid_generating (云端极速生成中)
+    // 更新项目状态为 grid_generating (云端生图中 / 本地等待调度)
     await db.update(projects).set({
       status: "grid_generating",
       updatedAt: new Date(),
     }).where(eq(projects.id, projectId));
 
-    try {
-      await colabClient.pushTaskToInbox({
-        taskId: task.id,
-        type: "image",
-        prompt,
-        refImages: referenceImages,
-        shots: script.shots || [],
-        driveOutputPath,
-      });
-      console.log(`[STATE-MACHINE] 九宫格生图任务 ${task.id} (带 ${referenceImages?.length || 0} 张参考图) 已推入云端 inbox`);
-    } catch (err: any) {
-      console.warn(`[STATE-MACHINE] Colab 离线或写入异常，九宫格生图任务在本地排队: ${err.message}`);
-      await db.update(cloudTasks).set({ state: "waiting_for_cloud" }).where(eq(cloudTasks.id, task.id));
-    }
+    // 核心改造：统一通过本地目录队列管理，离线时安全暂存，开机后自动消费上传
+    await localTaskDispatcher.enqueueTask({
+      taskId: task.id,
+      projectId,
+      shotId: 0,
+      taskType: "image_grid_gen",
+      type: "image",
+      prompt,
+      refImages: effectiveRefImages,
+      shots: script.shots || [],
+      driveOutputPath,
+      createdAt: Date.now(),
+      sessionName: session,
+    });
 
     return task;
   }
 
   /**
-   * 4. 提交至 Colab 视频生成队列 (加锁置灰)
+   * 4. 提交至 Colab 视频生成队列 (支持全量提交或单分镜增量重渲)
+   * 离线友好：若 Colab 尚未开机，生成本地任务并存入本地队列，开机后自动消费上传
+   * @param targetShotId 若传入则仅将该单分镜推入云端队列，其他已完成分镜绝对保留
    */
-  public async submitToCloudQueue(projectId: string, sessionName?: string) {
+  public async submitToCloudQueue(projectId: string, sessionName?: string, targetShotId?: number) {
     const project = await db.query.projects.findFirst({
       where: eq(projects.id, projectId),
     });
@@ -196,7 +199,11 @@ export class TaskManager {
       where: and(eq(cloudTasks.projectId, projectId), gt(cloudTasks.shotId, 0)),
     });
 
-    for (const shot of script.shots) {
+    const shotsToProcess = targetShotId
+      ? script.shots.filter((s) => s.id === targetShotId)
+      : script.shots;
+
+    for (const shot of shotsToProcess) {
       const existingTask = existingVideoTasks.find((t) => t.shotId === shot.id);
       const driveOutputPath = `${process.env.COLAB_DRIVE_OUTPUT_DIR || "/content/outputs"}/${projectId}_shot_${shot.id}.mp4`;
 
@@ -207,11 +214,16 @@ export class TaskManager {
           projectId,
           shotId: shot.id,
           sessionName: session,
-          state: "submitted_to_inbox",
+          state: "waiting_for_cloud",
           isLocked: true,
           driveOutputPath,
         }).returning();
         taskToPush = newTask;
+      } else {
+        await db.update(cloudTasks).set({
+          state: "waiting_for_cloud",
+          updatedAt: new Date(),
+        }).where(eq(cloudTasks.id, existingTask.id));
       }
 
       // 获取关键帧切片 (Base64 形式打包下发)
@@ -232,22 +244,73 @@ export class TaskManager {
       }
 
       if (taskToPush) {
-        try {
-          await colabClient.pushTaskToInbox({
-            taskId: taskToPush.id,
-            type: "video",
-            prompt: shot.description,
-            durationSec: shot.durationSec,
-            keyframeBase64,
-            driveOutputPath: taskToPush.driveOutputPath || driveOutputPath,
-          });
-          await db.update(cloudTasks).set({ state: "submitted_to_inbox" }).where(eq(cloudTasks.id, taskToPush.id));
-        } catch (err: any) {
-          console.warn(`[STATE-MACHINE] Colab 离线或写入 inbox 异常，任务在本地排队: ${err.message}`);
-          await db.update(cloudTasks).set({ state: "waiting_for_cloud" }).where(eq(cloudTasks.id, taskToPush.id));
-        }
+        // 核心改造：统一写入本地目录队列
+        await localTaskDispatcher.enqueueTask({
+          taskId: taskToPush.id,
+          projectId,
+          shotId: shot.id,
+          taskType: "video_gen",
+          type: "video",
+          prompt: shot.description,
+          durationSec: shot.durationSec,
+          keyframeBase64,
+          driveOutputPath: taskToPush.driveOutputPath || driveOutputPath,
+          createdAt: Date.now(),
+          sessionName: session,
+        });
       }
     }
+  }
+
+  /**
+   * 4.5 重新生成/入队任务 (针对等待 MiniMax-H3/Image 执行任务的情况)
+   * 支持用户在任务排队或异常时手动重新生成任务并放回本地队列消费
+   */
+  public async resubmitProjectTasks(projectId: string): Promise<{ mode: "image" | "video"; message: string }> {
+    const project = await db.query.projects.findFirst({
+      where: eq(projects.id, projectId),
+    });
+
+    if (!project) throw new Error("项目不存在");
+
+    // 清理该项目在本地 pending 目录中的旧任务
+    localTaskDispatcher.cleanPendingTasksForProject(projectId);
+
+    // 1. 若处于生图阶段 (grid_generating 或 尚未审核九宫格)
+    if (project.status === "grid_generating" || project.status === "grid_reviewing") {
+      // 重置该项目的 shotId === 0 的 cloudTasks
+      await db.update(cloudTasks).set({
+        state: "waiting_for_cloud",
+        updatedAt: new Date(),
+      }).where(and(eq(cloudTasks.projectId, projectId), eq(cloudTasks.shotId, 0)));
+
+      await this.submitGridImageToCloudQueue(projectId);
+      return {
+        mode: "image",
+        message: "MiniMax-H3-Image 九宫格生图任务已重新生成，已推入本地队列等待消费分发！",
+      };
+    }
+
+    // 2. 若处于视频生成阶段 (cloud_running / cloud_queued / grid_approved / clips_ready)
+    if (
+      project.status === "cloud_running" ||
+      project.status === "cloud_queued" ||
+      project.status === "grid_approved" ||
+      project.status === "clips_ready"
+    ) {
+      await db.update(cloudTasks).set({
+        state: "waiting_for_cloud",
+        updatedAt: new Date(),
+      }).where(and(eq(cloudTasks.projectId, projectId), gt(cloudTasks.shotId, 0)));
+
+      await this.submitToCloudQueue(projectId);
+      return {
+        mode: "video",
+        message: "MiniMax-H3 图生视频任务已重新生成，已推入本地队列等待消费分发！",
+      };
+    }
+
+    throw new Error(`当前项目状态 (${project.status}) 不属于等待 MiniMax 生成任务的阶段`);
   }
 
   /**

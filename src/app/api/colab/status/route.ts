@@ -1,11 +1,13 @@
 import { NextResponse } from "next/server";
 import { colabClient } from "@/lib/modules/colab-rpc/client";
+import { localTaskDispatcher } from "@/lib/modules/state-machine/local-dispatcher";
 
 export async function GET() {
   const status = colabClient.getStatus();
+  const localPendingCount = localTaskDispatcher.getPendingTasksCount();
   return NextResponse.json({
-    sessionName: process.env.COLAB_SESSION_NAME || "clipforge_helloworld1234",
     ...status,
+    localPendingTasksCount: localPendingCount,
   });
 }
 

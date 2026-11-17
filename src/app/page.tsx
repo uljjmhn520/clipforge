@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
+import Link from "next/link";
 import {
   Sparkles,
   Bot,
@@ -23,14 +24,18 @@ import {
   RefreshCw,
   ExternalLink,
   ChevronRight,
-  ChevronDown,
+  ChevronUp,
   Activity,
+  ChevronDown,
   X,
   Image as ImageIcon,
   Eye,
   Lock,
   Trash2,
-  Download
+  Download,
+  RotateCw,
+  CheckSquare,
+  Square
 } from "lucide-react";
 
 export default function DashboardPage() {
@@ -84,6 +89,10 @@ export default function DashboardPage() {
   // 全部项目进度列表
   const [projectList, setProjectList] = useState<any[]>([]);
   const [isLoadingProjects, setIsLoadingProjects] = useState<boolean>(false);
+  const [selectedProjectIds, setSelectedProjectIds] = useState<string[]>([]);
+  const [expandedProjectIds, setExpandedProjectIds] = useState<Record<string, boolean>>({});
+  const [redoingShots, setRedoingShots] = useState<Record<string, boolean>>({});
+  const [isBatchDeleting, setIsBatchDeleting] = useState<boolean>(false);
 
   const currentProject = projectList.find((p) => p.id === currentProjectId);
   const isGridGenerating = currentProject?.status === "grid_generating" || isGeneratingCloudGrid;
@@ -358,6 +367,122 @@ export default function DashboardPage() {
       fetchProjects();
     } catch (err: any) {
       alert(`删除失败: ${err.message}`);
+    }
+  };
+
+  // 批量选择切换
+  const handleToggleSelectProject = (id: string) => {
+    setSelectedProjectIds((prev) =>
+      prev.includes(id) ? prev.filter((item) => item !== id) : [...prev, id]
+    );
+  };
+
+  // 全选/取消全选
+  const handleSelectAllProjects = () => {
+    if (selectedProjectIds.length === projectList.length) {
+      setSelectedProjectIds([]);
+    } else {
+      setSelectedProjectIds(projectList.map((p) => p.id));
+    }
+  };
+
+  // 批量彻底删除
+  const handleBatchDelete = async () => {
+    if (selectedProjectIds.length === 0) return;
+    if (
+      !confirm(
+        `确定要彻底删除选中的 ${selectedProjectIds.length} 个视频项目及其所有本地视频与切片吗？此操作不可逆！`
+      )
+    ) {
+      return;
+    }
+    setIsBatchDeleting(true);
+    try {
+      const res = await fetch("/api/projects", {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ids: selectedProjectIds }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      alert(data.message || `已成功批量删除 ${selectedProjectIds.length} 个视频项目！`);
+      if (currentProjectId && selectedProjectIds.includes(currentProjectId)) {
+        handleNewProject();
+      }
+      setSelectedProjectIds([]);
+      fetchProjects();
+    } catch (err: any) {
+      alert(`批量删除失败: ${err.message}`);
+    } finally {
+      setIsBatchDeleting(false);
+    }
+  };
+
+  // 展开/收起媒体资源折叠面板
+  const handleToggleExpandProject = (id: string) => {
+    setExpandedProjectIds((prev) => ({
+      ...prev,
+      [id]: !prev[id],
+    }));
+  };
+
+  // 就地一键单分镜重做
+  const handleRedoShot = async (projectId: string, shotId: number) => {
+    const key = `${projectId}_${shotId}`;
+    setRedoingShots((prev) => ({ ...prev, [key]: true }));
+    try {
+      const res = await fetch("/api/colab/redo-shot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId, shotId, action: "video" }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      alert(data.message || `分镜 ${shotId} 重做任务已推入云端！`);
+      fetchProjects();
+    } catch (err: any) {
+      alert(`重做分镜失败: ${err.message}`);
+    } finally {
+      setRedoingShots((prev) => ({ ...prev, [key]: false }));
+    }
+  };
+
+  // 就地重新合成整片
+  const handleRecomposeProject = async (projectId: string) => {
+    try {
+      const res = await fetch("/api/compose/render", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      alert("视频已重新合成完毕！");
+      fetchProjects();
+    } catch (err: any) {
+      alert(`重新合成失败: ${err.message}`);
+    }
+  };
+
+  // 重新生成/入队任务 (针对等待 MiniMax-H3/Image 离线或排队的情况)
+  const [resubmittingProjects, setResubmittingProjects] = useState<{ [projectId: string]: boolean }>({});
+
+  const handleResubmitTask = async (projectId: string) => {
+    setResubmittingProjects((prev) => ({ ...prev, [projectId]: true }));
+    try {
+      const res = await fetch("/api/colab/resubmit-task", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ projectId }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      alert(data.message || "任务已成功重新生成并入队本地任务目录！");
+      fetchProjects();
+    } catch (err: any) {
+      alert(`重新生成任务失败: ${err.message}`);
+    } finally {
+      setResubmittingProjects((prev) => ({ ...prev, [projectId]: false }));
     }
   };
 
@@ -694,6 +819,14 @@ export default function DashboardPage() {
                 </span>
               )}
             </button>
+            <Link
+              href="/colab"
+              className="px-3.5 py-1.5 rounded-lg text-xs font-semibold flex items-center gap-1.5 text-zinc-400 hover:text-amber-300 transition"
+              title="查看 Colab 云端渲染进度与硬件仪表盘"
+            >
+              <Activity className="w-3.5 h-3.5 text-amber-400" />
+              Colab 算力中心
+            </Link>
           </div>
 
           <button
@@ -1596,7 +1729,7 @@ export default function DashboardPage() {
                 全部视频生成任务进度
               </h2>
               <p className="text-xs text-zinc-400 mt-0.5">
-                实时追踪每个视频项目的阶段进度与当前状态，点击可直接切入对应工作台步骤
+                实时追踪每个视频项目的阶段进度与当前状态，支持就地查看分镜音画资产、一键重做与批量删除
               </p>
             </div>
 
@@ -1619,6 +1752,43 @@ export default function DashboardPage() {
             </div>
           </div>
 
+          {/* 批量操作控制栏 */}
+          {projectList.length > 0 && (
+            <div className="bg-zinc-900/80 p-3.5 rounded-xl border border-zinc-800 flex items-center justify-between text-xs">
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={handleSelectAllProjects}
+                  className="flex items-center gap-2 text-zinc-300 hover:text-white transition font-medium"
+                >
+                  {selectedProjectIds.length === projectList.length && projectList.length > 0 ? (
+                    <CheckSquare className="w-4 h-4 text-emerald-400" />
+                  ) : (
+                    <Square className="w-4 h-4 text-zinc-500" />
+                  )}
+                  全选 ({projectList.length})
+                </button>
+                {selectedProjectIds.length > 0 && (
+                  <span className="px-2 py-0.5 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 text-[11px] font-semibold">
+                    已勾选 {selectedProjectIds.length} 项
+                  </span>
+                )}
+              </div>
+
+              {selectedProjectIds.length > 0 && (
+                <button
+                  type="button"
+                  onClick={handleBatchDelete}
+                  disabled={isBatchDeleting}
+                  className="px-3.5 py-1.5 rounded-lg bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/30 font-bold flex items-center gap-1.5 transition disabled:opacity-50"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  {isBatchDeleting ? "正在批量清理..." : `彻底删除已选 (${selectedProjectIds.length})`}
+                </button>
+              )}
+            </div>
+          )}
+
           {/* 项目任务列表表格/卡片 */}
           {projectList.length === 0 ? (
             <div className="border-2 border-dashed border-zinc-800 rounded-2xl p-16 text-center space-y-3">
@@ -1627,132 +1797,366 @@ export default function DashboardPage() {
             </div>
           ) : (
             <div className="space-y-4">
-              {projectList.map((item) => (
-                <div
-                  key={item.id}
-                  className="bg-zinc-900/60 p-5 rounded-2xl border border-zinc-800 hover:border-zinc-700 transition space-y-4"
-                >
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-3">
-                      <div className="w-9 h-9 rounded-xl bg-zinc-800 flex items-center justify-center text-emerald-400 font-bold text-xs">
-                        {item.step}/4
-                      </div>
-                      <div>
-                        <h3 className="text-sm font-bold text-zinc-100 flex items-center gap-2">
-                          {item.name}
-                          <span className="text-[11px] font-normal text-zinc-400">
-                            ({item.productName} · {item.productPrice || "特惠"})
-                          </span>
-                        </h3>
-                        <p className="text-[11px] text-zinc-500">
-                          创建时间: {new Date(item.createdAt).toLocaleString("zh-CN")}
-                        </p>
-                      </div>
-                    </div>
+              {projectList.map((item) => {
+                const isSelected = selectedProjectIds.includes(item.id);
+                const isExpanded = !!expandedProjectIds[item.id];
 
-                    <div className="flex items-center gap-3">
-                      {/* 进度徽章 */}
-                      {item.step === 5 ? (
-                        <span className="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs font-semibold flex items-center gap-1">
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          已成片输出
-                        </span>
-                      ) : item.status === "cloud_running" ? (
-                        <span className="px-2.5 py-1 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/20 text-xs font-semibold flex items-center gap-1">
-                          <Lock className="w-3 h-3" />
-                          云端渲染中 (只读锁定)
-                        </span>
-                      ) : item.step === 4 ? (
-                        <span className="px-2.5 py-1 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 text-xs font-semibold flex items-center gap-1">
-                          <CheckCircle2 className="w-3.5 h-3.5" />
-                          九宫格已审通过
-                        </span>
-                      ) : item.step === 3 ? (
-                        <span className="px-2.5 py-1 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 text-xs font-semibold flex items-center gap-1">
-                          <AlertCircle className="w-3.5 h-3.5" />
-                          待人工审核九宫格
-                        </span>
-                      ) : item.step === 2 ? (
-                        <span className="px-2.5 py-1 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20 text-xs font-semibold flex items-center gap-1">
-                          <Bot className="w-3.5 h-3.5" />
-                          剧本已生成 ({item.shotsCount}分镜)
-                        </span>
-                      ) : (
-                        <span className="px-2.5 py-1 rounded-full bg-zinc-800 text-zinc-400 border border-zinc-700 text-xs font-semibold">
-                          草稿策划中
-                        </span>
-                      )}
-
-                      {/* 复制文案按钮 */}
-                      <button
-                        type="button"
-                        onClick={() => handleCopyProjectScript(item.id)}
-                        className="px-2.5 py-1.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium flex items-center gap-1 transition"
-                        title="复制该项目完整分镜脚本与台词"
-                      >
-                        <Copy className="w-3.5 h-3.5 text-amber-400" />
-                        文案
-                      </button>
-
-                      {/* 下载成片按钮 */}
-                      {item.videoUrl && (
-                        <a
-                          href={item.videoUrl}
-                          download={`${item.name || "video"}.mp4`}
-                          className="px-2.5 py-1.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium flex items-center gap-1 transition"
-                          title="下载成片 MP4"
+                return (
+                  <div
+                    key={item.id}
+                    className={`bg-zinc-900/60 p-5 rounded-2xl border transition space-y-4 ${
+                      isSelected ? "border-emerald-500/50 bg-emerald-500/[0.02]" : "border-zinc-800 hover:border-zinc-700"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-3">
+                        {/* 勾选框 */}
+                        <button
+                          type="button"
+                          onClick={() => handleToggleSelectProject(item.id)}
+                          className="p-1 rounded hover:bg-zinc-800 text-zinc-400 transition"
+                          title="选择该项目"
                         >
-                          <Download className="w-3.5 h-3.5 text-cyan-400" />
-                          下载
-                        </a>
-                      )}
+                          {isSelected ? (
+                            <CheckSquare className="w-4 h-4 text-emerald-400" />
+                          ) : (
+                            <Square className="w-4 h-4 text-zinc-600" />
+                          )}
+                        </button>
 
-                      {/* 跳转工作台按钮 */}
-                      <button
-                        onClick={() => handleLoadProject(item.id)}
-                        className="px-3.5 py-1.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-bold flex items-center gap-1 transition"
-                      >
-                        载入工作台
-                        <ChevronRight className="w-3.5 h-3.5 text-emerald-400" />
-                      </button>
+                        <div className="w-9 h-9 rounded-xl bg-zinc-800 flex items-center justify-center text-emerald-400 font-bold text-xs">
+                          {item.step}/4
+                        </div>
+                        <div>
+                          <h3 className="text-sm font-bold text-zinc-100 flex items-center gap-2">
+                            {item.name}
+                            <span className="text-[11px] font-normal text-zinc-400">
+                              ({item.productName} · {item.productPrice || "特惠"})
+                            </span>
+                          </h3>
+                          <p className="text-[11px] text-zinc-500">
+                            创建时间: {new Date(item.createdAt).toLocaleString("zh-CN")}
+                          </p>
+                        </div>
+                      </div>
 
-                      {/* 删除项目按钮 */}
-                      <button
-                        type="button"
-                        onClick={() => handleDeleteProject(item.id, item.name)}
-                        className="p-1.5 rounded-xl bg-zinc-800 hover:bg-red-500/20 text-zinc-400 hover:text-red-400 transition"
-                        title="彻底删除该视频项目"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
+                      <div className="flex items-center gap-3">
+                        {/* 进度徽章 */}
+                        {item.step === 5 ? (
+                          <span className="px-2.5 py-1 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 text-xs font-semibold flex items-center gap-1">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            已成片输出
+                          </span>
+                        ) : item.status === "grid_generating" ? (
+                          <span className="px-2.5 py-1 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 text-xs font-semibold flex items-center gap-1">
+                            <Clock className="w-3.5 h-3.5 animate-pulse" />
+                            九宫格生图中 (排队/等待云端)
+                          </span>
+                        ) : item.status === "cloud_running" ? (
+                          <span className="px-2.5 py-1 rounded-full bg-purple-500/10 text-purple-400 border border-purple-500/20 text-xs font-semibold flex items-center gap-1">
+                            <Lock className="w-3 h-3 animate-pulse" />
+                            视频云端渲染中 (只读锁定)
+                          </span>
+                        ) : item.status === "cloud_queued" || item.hasWaitingTasks ? (
+                          <span className="px-2.5 py-1 rounded-full bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 text-xs font-semibold flex items-center gap-1">
+                            <Clock className="w-3.5 h-3.5" />
+                            本地队列就绪 (等待云端消费)
+                          </span>
+                        ) : item.step === 4 ? (
+                          <span className="px-2.5 py-1 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 text-xs font-semibold flex items-center gap-1">
+                            <CheckCircle2 className="w-3.5 h-3.5" />
+                            九宫格已审通过
+                          </span>
+                        ) : item.step === 3 ? (
+                          <span className="px-2.5 py-1 rounded-full bg-amber-500/10 text-amber-400 border border-amber-500/20 text-xs font-semibold flex items-center gap-1">
+                            <AlertCircle className="w-3.5 h-3.5" />
+                            待人工审核九宫格
+                          </span>
+                        ) : item.step === 2 ? (
+                          <span className="px-2.5 py-1 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20 text-xs font-semibold flex items-center gap-1">
+                            <Bot className="w-3.5 h-3.5" />
+                            剧本已生成 ({item.shotsCount}分镜)
+                          </span>
+                        ) : (
+                          <span className="px-2.5 py-1 rounded-full bg-zinc-800 text-zinc-400 border border-zinc-700 text-xs font-semibold">
+                            草稿策划中
+                          </span>
+                        )}
+
+                        {/* 重新生成任务按钮 (处于等待 minimax-h3 或 minimax-h3-image 状态时展示) */}
+                        {(item.status === "grid_generating" ||
+                          item.status === "cloud_running" ||
+                          item.status === "cloud_queued" ||
+                          item.hasWaitingTasks) && (
+                          <button
+                            type="button"
+                            onClick={() => handleResubmitTask(item.id)}
+                            disabled={resubmittingProjects[item.id]}
+                            className="px-2.5 py-1.5 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 text-xs font-medium flex items-center gap-1 transition"
+                            title="重新生成并推入本地队列 (防云端离线或卡死)"
+                          >
+                            <RotateCw
+                              className={`w-3.5 h-3.5 text-amber-400 ${
+                                resubmittingProjects[item.id] ? "animate-spin" : ""
+                              }`}
+                            />
+                            {resubmittingProjects[item.id] ? "重置中..." : "重新生成任务"}
+                          </button>
+                        )}
+
+                        {/* 展开/收起资产折叠面板按钮 */}
+                        <button
+                          type="button"
+                          onClick={() => handleToggleExpandProject(item.id)}
+                          className={`px-3 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 transition border ${
+                            isExpanded
+                              ? "bg-cyan-500/10 border-cyan-500/30 text-cyan-300"
+                              : "bg-zinc-800 hover:bg-zinc-700 text-zinc-300 border-zinc-700"
+                          }`}
+                          title="就地查看成片视频、各分镜切片视频与九宫格关键帧大图"
+                        >
+                          <Film className="w-3.5 h-3.5 text-cyan-400" />
+                          {isExpanded ? "收起资产" : "查看资产与分镜"}
+                          {isExpanded ? (
+                            <ChevronUp className="w-3.5 h-3.5" />
+                          ) : (
+                            <ChevronDown className="w-3.5 h-3.5" />
+                          )}
+                        </button>
+
+                        {/* 复制文案按钮 */}
+                        <button
+                          type="button"
+                          onClick={() => handleCopyProjectScript(item.id)}
+                          className="px-2.5 py-1.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium flex items-center gap-1 transition"
+                          title="复制该项目完整分镜脚本与台词"
+                        >
+                          <Copy className="w-3.5 h-3.5 text-amber-400" />
+                          文案
+                        </button>
+
+                        {/* 下载成片按钮 */}
+                        {item.videoUrl && (
+                          <a
+                            href={item.videoUrl}
+                            download={`${item.name || "video"}.mp4`}
+                            className="px-2.5 py-1.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-xs font-medium flex items-center gap-1 transition"
+                            title="下载成片 MP4"
+                          >
+                            <Download className="w-3.5 h-3.5 text-cyan-400" />
+                            下载
+                          </a>
+                        )}
+
+                        {/* 跳转工作台按钮 */}
+                        <button
+                          onClick={() => handleLoadProject(item.id)}
+                          className="px-3.5 py-1.5 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-bold flex items-center gap-1 transition"
+                        >
+                          载入工作台
+                          <ChevronRight className="w-3.5 h-3.5 text-emerald-400" />
+                        </button>
+
+                        {/* 删除项目按钮 */}
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteProject(item.id, item.name)}
+                          className="p-1.5 rounded-xl bg-zinc-800 hover:bg-red-500/20 text-zinc-400 hover:text-red-400 transition"
+                          title="彻底删除该视频项目"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
-                  </div>
 
-                  {/* 步骤条进度指示器 */}
-                  <div className="grid grid-cols-4 gap-2 pt-2 border-t border-zinc-800/80">
-                    <div
-                      className={`h-1.5 rounded-full ${
-                        item.step >= 1 ? "bg-emerald-500" : "bg-zinc-800"
-                      }`}
-                    />
-                    <div
-                      className={`h-1.5 rounded-full ${
-                        item.step >= 2 ? "bg-emerald-500" : "bg-zinc-800"
-                      }`}
-                    />
-                    <div
-                      className={`h-1.5 rounded-full ${
-                        item.step >= 3 ? "bg-emerald-500" : "bg-zinc-800"
-                      }`}
-                    />
-                    <div
-                      className={`h-1.5 rounded-full ${
-                        item.step >= 4 ? "bg-emerald-500" : "bg-zinc-800"
-                      }`}
-                    />
+                    {/* 步骤条进度指示器 */}
+                    <div className="grid grid-cols-4 gap-2 pt-2 border-t border-zinc-800/80">
+                      <div
+                        className={`h-1.5 rounded-full ${
+                          item.step >= 1 ? "bg-emerald-500" : "bg-zinc-800"
+                        }`}
+                      />
+                      <div
+                        className={`h-1.5 rounded-full ${
+                          item.step >= 2 ? "bg-emerald-500" : "bg-zinc-800"
+                        }`}
+                      />
+                      <div
+                        className={`h-1.5 rounded-full ${
+                          item.step >= 3 ? "bg-emerald-500" : "bg-zinc-800"
+                        }`}
+                      />
+                      <div
+                        className={`h-1.5 rounded-full ${
+                          item.step >= 4 ? "bg-emerald-500" : "bg-zinc-800"
+                        }`}
+                      />
+                    </div>
+
+                    {/* 就地展开的媒体资产与分镜切片大面板 (Accordion) */}
+                    {isExpanded && (
+                      <div className="pt-4 border-t border-zinc-800/80 space-y-4">
+                        {/* 1. 成片展示与整片重新合成 */}
+                        {item.videoUrl && (
+                          <div className="bg-zinc-950/80 p-4 rounded-xl border border-zinc-800 flex flex-col md:flex-row items-center gap-4">
+                            <video
+                              src={item.videoUrl}
+                              controls
+                              className="w-52 h-32 object-cover rounded-lg border border-zinc-700 bg-black shadow-md"
+                            />
+                            <div className="flex-1 space-y-1.5 text-xs">
+                              <div className="font-bold text-zinc-100 flex items-center gap-1.5 text-sm">
+                                <Film className="w-4 h-4 text-emerald-400" />
+                                最终已合成商业成片
+                              </div>
+                              <p className="text-zinc-400 leading-relaxed">
+                                已烧录思源黑体字幕、商品价格标签与合规 AIGC 标识。若您单独重做了某个分镜片段，可点击右侧「重新合成整片」刷新成片。
+                              </p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={() => handleRecomposeProject(item.id)}
+                                className="px-3.5 py-2 rounded-xl bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold flex items-center gap-1.5 transition"
+                                title="基于当前各分镜片段重新运行 NVENC 压制合成"
+                              >
+                                <RotateCw className="w-3.5 h-3.5 text-emerald-400" />
+                                重新合成整片
+                              </button>
+                              <a
+                                href={item.videoUrl}
+                                download={`${item.name || "video"}.mp4`}
+                                className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-black text-xs font-bold flex items-center gap-1.5 transition shadow-sm"
+                              >
+                                <Download className="w-3.5 h-3.5" />
+                                下载视频
+                              </a>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* 2. 九宫格大图预览 (若有) */}
+                        {item.gridImageUrl && (
+                          <div className="bg-zinc-950/50 p-3 rounded-xl border border-zinc-800 flex items-center justify-between text-xs">
+                            <div className="flex items-center gap-3">
+                              <img
+                                src={item.gridImageUrl}
+                                alt="九宫格原图"
+                                className="w-12 h-16 object-cover rounded border border-zinc-700 bg-black"
+                              />
+                              <div>
+                                <div className="font-semibold text-zinc-200">3x3 九宫格大图原图</div>
+                                <div className="text-[11px] text-zinc-400">MiniMax-H3-Image 扩散生成的高清分镜底图</div>
+                              </div>
+                            </div>
+                            <a
+                              href={item.gridImageUrl}
+                              target="_blank"
+                              rel="noreferrer"
+                              className="text-xs text-cyan-400 hover:underline flex items-center gap-1 font-medium"
+                            >
+                              查看高清原图 <ExternalLink className="w-3.5 h-3.5" />
+                            </a>
+                          </div>
+                        )}
+
+                        {/* 3. 各分镜头音画资产与独立重做卡片网格 */}
+                        <div className="space-y-2.5">
+                          <div className="text-xs font-bold text-zinc-200 flex items-center gap-1.5">
+                            <Layers className="w-4 h-4 text-cyan-400" />
+                            各分镜头首帧、片段视频与独立重做 ({item.shots?.length || 0} 个镜头)
+                          </div>
+
+                          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+                            {(item.shots || []).map((shot: any) => {
+                              const redoKey = `${item.id}_${shot.id}`;
+                              const isRedoing = redoingShots[redoKey];
+                              return (
+                                <div
+                                  key={shot.id}
+                                  className="bg-zinc-950/90 p-3.5 rounded-xl border border-zinc-800 hover:border-zinc-700 transition flex flex-col justify-between space-y-3"
+                                >
+                                  {/* 头部信息 */}
+                                  <div className="flex items-center justify-between text-xs">
+                                    <span className="font-bold text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/20">
+                                      分镜 {shot.id}
+                                    </span>
+                                    <span className="text-[11px] text-zinc-400">
+                                      时长: {shot.durationSec || 4} 秒
+                                    </span>
+                                  </div>
+
+                                  {/* 左右并排：首帧关键帧图片 vs 分段视频 */}
+                                  <div className="grid grid-cols-2 gap-2 h-36">
+                                    {/* 首帧图片 */}
+                                    <div className="relative rounded-lg overflow-hidden border border-zinc-800 bg-black flex items-center justify-center">
+                                      {shot.keyframeUrl ? (
+                                        <img
+                                          src={shot.keyframeUrl}
+                                          alt={`镜头${shot.id}首帧`}
+                                          className="w-full h-full object-cover"
+                                        />
+                                      ) : (
+                                        <div className="text-[10px] text-zinc-500 text-center p-2">
+                                          首帧图片待生成
+                                        </div>
+                                      )}
+                                      <span className="absolute bottom-1 left-1 px-1.5 py-0.5 rounded bg-black/70 text-[9px] text-zinc-300 backdrop-blur">
+                                        首帧关键帧
+                                      </span>
+                                    </div>
+
+                                    {/* 分段视频 */}
+                                    <div className="relative rounded-lg overflow-hidden border border-zinc-800 bg-black flex items-center justify-center">
+                                      {shot.clipUrl ? (
+                                        <video
+                                          src={shot.clipUrl}
+                                          controls
+                                          className="w-full h-full object-cover"
+                                        />
+                                      ) : (
+                                        <div className="text-[10px] text-zinc-500 text-center p-2 flex flex-col items-center gap-1">
+                                          <Clock className="w-4 h-4 text-zinc-600" />
+                                          分镜视频待渲染
+                                        </div>
+                                      )}
+                                      {shot.clipUrl && (
+                                        <span className="absolute top-1 right-1 px-1.5 py-0.5 rounded bg-cyan-500/90 text-[9px] text-black font-bold backdrop-blur">
+                                          片段就绪
+                                        </span>
+                                      )}
+                                    </div>
+                                  </div>
+
+                                  {/* 台词与分镜描述 */}
+                                  <div className="text-[11px] text-zinc-300 bg-zinc-900/60 p-2.5 rounded-lg border border-zinc-800/80 line-clamp-2 leading-relaxed">
+                                    <span className="text-zinc-500 mr-1">台词:</span>
+                                    {shot.voiceover || shot.description || "无解说文案"}
+                                  </div>
+
+                                  {/* 独立重做控制 */}
+                                  <div className="pt-1 border-t border-zinc-800/60">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleRedoShot(item.id, shot.id)}
+                                      disabled={isRedoing}
+                                      className="w-full py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-200 text-xs font-semibold flex items-center justify-center gap-1.5 transition disabled:opacity-50"
+                                      title="对当前分镜运镜不满意？一键单独推入 Colab 云端重做该镜头"
+                                    >
+                                      <RotateCw className={`w-3.5 h-3.5 text-amber-400 ${isRedoing ? "animate-spin" : ""}`} />
+                                      {isRedoing ? "正在下发重做..." : "重做此分镜视频"}
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      </div>
+                    )}
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </main>

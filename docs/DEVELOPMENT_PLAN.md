@@ -1,120 +1,97 @@
-# 开发目标与进度跟踪计划 (v2.5 文件队列与断线重连定案版)
+# 开发目标与进度跟踪计划 (v3.0 三层架构与 Colab 极速双向通信重构版)
 
-本文档跟踪项目从零构建到成熟上线的全生命周期任务列表，包含了 Colab 基于文件的 Append-Only 任务队列 (`inbox.jsonl` / `outbox.jsonl`)、断线无缝重连补偿、stdio JSON-RPC Ping-Pong 心跳、两阶段看门狗、专属持久化 Session 绑定（20 字符长度）、Gemini 3.8 动态模型列表、Colab 离线排队门禁、Google Drive 持久化与任务状态强锁定机制。
-
----
-
-## 一、 开发总目标
-
-构建一套**高度自治、安全防烧、人机强协作、零版权纠纷、极具网络容错性**的 AI 商业带货短视频系统。
-* **输入**：商品实拍图 1~3 张 + 核心卖点 / 痛点简述（或外部手搓九宫格大图）
-* **核心产出**：30 秒左右竖屏 9:16 高清带货短视频（包含角色动作、环境音、自然口语配音、高亮逐字字幕、AIGC 标识）
-* **高可用通信规范**：
-  * 基于 Colab 实例本地文件 `/content/inbox.jsonl` 与 `/content/outbox.jsonl` 的 Append 容错日志队列；
-  * `colab exec` 长时间任务即使中途网络中断，云端静默渲染不中断，重连后瞬间补录结果；
-  * 15 秒主动 Ping-Pong 心跳保持管道活跃与监控；
-  * 生成原片持久化保存至 Google Drive 固定目录。
-* **全生命周期算力防烧保护**：
-  * **阶段 1 启动看门狗**：开机即激活，默认 15 分钟（本地可配），超期未就绪强行释放停机；
-  * **阶段 2 忙闲看门狗**：就绪后接管，BUSY 冻结计时，IDLE 满 5 分钟（本地可配）自动释放，第 4 分钟提供 Web 续命；
-  * 默认选用性价比最高的 NVIDIA L4 显卡（显存 24G，消耗极低算力点）。
+本文档跟踪项目全生命周期的里程碑与任务清单。确立了本地 (UI/计算/状态机/独立监控看板)、Colab 云端 (秒级双向通信/多线程拉取/目录队列文生图与图生视频/双阶看门狗) 与第三方 API (Edge-TTS / Gemini API) 的三层清晰职责边界。
 
 ---
 
-## 二、 阶段性里程碑与进度表
+## 一、 开发总目标与三层架构
 
-### 阶段 0：环境与决策定案（当前阶段）
-- [x] 原项目代码归档至 `temp/from_src/`
-- [x] 整体技术架构与软硬件分工锁定（Node.js / TS 全栈）
-- [x] 商业版权与合规矩阵敲定（字体、模型、TTS）
-- [x] 九宫格双通道（AI/手工）+ 强人工审核闸门机制锁定
-- [x] Colab 专属 Session Name（`clipforge_[20字符Session]`）绑定规范确立
-- [x] Append-Only 文件日志任务队列 (`inbox.jsonl`/`outbox.jsonl`) 机制确立
-- [x] stdio JSON-RPC 协议与 15 秒主动 Ping-Pong 心跳机制确立
-- [x] `colab exec` 本地可控超时配置（默认 600s）定案
-- [x] 两阶段全周期看门狗方案（启动15分钟 + 运行期忙闲轮询 + 本地参数可配）定案
-- [x] Google Drive 路径映射与 GPU (L4 / A100) 规格确定
-- [x] 数据库细粒度状态机与云端生成只读锁定规范确立
-- [ ] 申请并配置 Google AI Studio 的 `GEMINI_API_KEY`
-- [ ] 验证本地 Tesla T4 硬件编解码：FFmpeg `h264_nvenc`
-- [ ] 下载开源商用字体（思源黑体、阿里普惠体）存入 `assets/fonts/`
+构建一套**高度自治、安全防烧、零版权纠纷、极具网络容错性、过程完全透明掌控**的商业带货短视频系统。
 
----
-
-### 阶段 1：Next.js 全栈后端骨架与本地视频引擎
-> **目标**：搭建轻量稳定的本地服务，打通状态机与 FFmpeg 硬件加速流水线。
-
-- [ ] **项目脚手架搭建**：
-  - 初始化 Next.js (App Router) + TypeScript + TailwindCSS；
-  - 配置 Drizzle ORM + SQLite (`better-sqlite3`)，建立 `projects`, `shots`, `cloud_tasks` 等状态表；
-  - 实现状态机枚举：`draft` -> `grid_reviewing` -> `grid_approved` -> `cloud_queued` -> `cloud_running (locked)` -> `cloud_done` -> `completed`。
-- [ ] **商业合规配音模块 (TTS)**：
-  - 接入硅基流动 / 阿里百炼 CosyVoice 2 API，同时预留本地 T4 伴生推理端点；
-  - 实现配音音频保存与试听接口。
-- [ ] **本地 Faster-Whisper ASR**：
-  - 基于 `@huggingface/transformers` 或本地二进制抽取单字毫秒级时间戳。
-- [ ] **FFmpeg 硬件音频合成与 Voice Grounding 验证**：
-  - 编写手机麦克风 EQ 模拟滤镜（90Hz 高通 + 9500Hz 低通 + 3:1 动态压缩）；
-  - 混入微弱布朗环境底噪，验证音频“消除数码死寂”效果。
+* **1. 本地层 (Local)**：
+  - Next.js 14/15 App Router 全栈架构；
+  - Drizzle ORM + SQLite 持久化本地状态；
+  - 专属独立监控看板页面 (`/colab`)：实时掌握云端初始化、组件安装速度、硬件真实占用与任务队列；
+  - 本地 FFmpeg NVENC 硬件压制与字幕混音。
+* **2. Colab 云端层 (Cloud)**：
+  - **阶段 1：极速通信依赖安装**：开机第 1 秒安装 psutil (<5s)；
+  - **阶段 2：启动双向通信服务**：立即启动 `runner.py` 与本地 OpenSSH stdio 连通，实现 0 等待握手；
+  - **阶段 3：受控多线程拉取依赖与模型**：aria2 多线程拉取 ComfyUI、MiniMax-H3/Image 权重 (40GB+) 与 DMAD 4 步 LoRA 至临时盘 `/content/models/`，流式推送下载速度与进度；
+  - **阶段 4：顺序扫描执行任务队列**：轮询 `/content/tasks/pending/`，执行文生图与图生视频，任务移至 `completed/`，产物直存 Google Drive 并回传本地；
+  - **两阶段看门狗**：阶段 1 (启动 15 分钟) + 阶段 2 (运行期忙闲轮询 5 分钟，忙时冻结倒计时)。
+* **3. 第三方 API 服务层 (External APIs)**：
+  - **Edge-TTS**：零成本、高保真配音，免 API 密钥，开箱即用；
+  - **Gemini API**：卖点提炼、分镜生成与五判官质检（默认 Gemini 3.5 / 3.8 Flash）。
 
 ---
 
-### 阶段 2：Gemini 动态模型接入与脚本五判官机制
-> **目标**：动态获取最新 Gemini 模型（默认 Gemini 3.8 Flash），输出结构化、符合广告法的优质电商分镜。
+## 二、 阶段性里程碑与进度表 (Timeline)
 
-- [ ] **Gemini 动态模型列表获取**：
-  - 调用 Google AI Studio `client.models.list()` 接口，拉取可用列表并过滤；
-  - WebUI 设置页提供模型下拉框，默认自动选中 `gemini-3.8-flash`（或当前最新版本）。
-- [ ] **Gemini 多模态卖点提炼与分镜生成**：
-  - 输入商品实拍图，输出标准 JSON 分镜（4~6 镜）。
-- [ ] **五判官质检与等长重写系统**：
-  - 节奏官（Pace）、口语官（Voice）、画面官（Visual）；
-  - 等长校验：计算重写前后字数，防止 TTS 音频超出分镜预定时长；
-  - 广告法违禁词自动拦截与替换。
-- [ ] **外部生图 Prompt 导出器**：
-  - 为 Google Flow / Midjourney 生成专属优化的 3x3 九宫格 Prompt。
+### 阶段 0：架构重构与规范对齐 (当前阶段 - 100% 完成)
+- [x] 重构系统架构为本地、Colab云端、外部API三层体系 (`docs/ARCHITECTURE.md`)
+- [x] 模块化职责与目录队列重构 (`docs/MODULE_DESIGN.md`)
+- [x] 配音方案全面对齐微软 Edge-TTS (替换原商业 CosyVoice 强依赖)
+- [x] 确立 Colab 四阶段生命周期 (秒级握手 -> 流式安装 -> 目录任务队列 -> 看门狗)
+- [x] 定案本地独立监控看板页面 (`/colab`) 功能与 1~2s 短轮询通信规范
 
 ---
 
-### 阶段 3：九宫格切片、强人工审核工作台与 Colab 文件队列断线恢复
-> **目标**：实现九宫格切片审核，打通与 Colab L4 的文件队列与断线重连，落实两阶段看门狗与 Drive 保存。
-
-- [ ] **九宫格几何切片与单格替换**：
-  - 后端基于 `sharp` 实现 3x3 图像切片；
-  - 前端关键帧审查工作台：支持预览 9 格，支持对局部某一格单独上传图片替换。
-- [ ] **强人工审核与状态锁定**：
-  - 人工点击“确认通过”后，状态跃迁至 `grid_approved`；
-  - 当推入云端开始渲染时，状态跃迁至 `cloud_running`，前端立即锁定置灰，禁止修改图文。
-- [ ] **Colab Notebook 节点编写 (L4 默认)**：
-  - 启动时自动挂载 Google Drive（存储路径 `/content/drive/MyDrive/ClipForge/outputs/`）；
-  - 绑定专属持久化 Session（如 `clipforge_helloworld1234`）；
-  - **部署两阶段全周期看门狗**：
-    - 开机即走启动倒计时（默认 15 分钟，参数由本地传入）；
-    - 服务就绪后切入忙闲轮询模式（BUSY 冻结，IDLE 倒计时 5 分钟）；
-  - **实现 `/content/inbox.jsonl` 游标消费器与 `/content/outbox.jsonl` 结果落盘**；
-  - 响应 stdio 的 `heartbeat.ping`，回传 BUSY/IDLE 状态、已处理行号及剩余关机秒数。
-- [ ] **本地断线重连补录客户端**：
-  - 封装向 `/content/inbox.jsonl` 追加任务；
-  - 掉线后重新发起连接，读取 `/content/outbox.jsonl` 自动补录断线期间完成的视频，无缝接续。
+### 阶段 1：Colab 云端代码重构 (`colab/`) (进行中)
+> **目标**：实现秒级开机通信、aria2 多线程受控安装并实时上报、目录队列顺序扫描。
+- [x] 更新 `colab/clipforge_colab.ipynb` 笔记本执行逻辑 (符合 1-2-3-4 序)
+- [x] 重构 `colab/runner.py`：
+  - 秒级启动 stdio JSON-RPC 双向通道；
+  - 启动后台受控安装线程 (aria2 速率/进度推送)；
+  - 扫描 `/content/tasks/pending/` 执行文生图与图生视频；
+  - 上报 CPU / RAM / GPU / VRAM / 下载速度真实指标。
+- [x] 重构 `colab/setup_env.sh`：支持分步安装与细粒度状态埋点。
+- [x] 验证 `colab/minimax_engine.py` 任务调用。
 
 ---
 
-### 阶段 4：FFmpeg 综合流水线与成片输出
-> **目标**：将视频、音频、字幕、角标在本地 T4 上合成出完整的商业可用成片。
-
-- [ ] **流规范化滤镜链 (SEGMENT_NORM)**：
-  - 统一像素格式 `format=yuv420p,setsar=1,fps=30,settb=AVTB`。
-- [ ] **卡拉OK与字幕烧录**：
-  - 结合 Whisper 时间戳，使用思源黑体烧录底部字幕，测试标点不截断与价格（如 ¥99.9）不换行规则。
-- [ ] **AIGC 标识与商品角标**：
-  - 视频前 3 秒烧录“本视频由 AI 辅助生成”合规角标；
-  - 左下角渲染商品小卡片。
-- [ ] **全片 EBU R128 响度标准化**。
+### 阶段 2：本地 Node.js 客户端与 Colab 监控看板页 (`/colab`) (已完成)
+> **目标**：本地随时感知云端在干什么、进度如何，提供一键控制。
+- [x] 扩展 `src/lib/modules/colab-rpc/client.ts`：
+  - 适配目录队列投递 `/content/tasks/pending/`；
+  - 收集安装流程阶段、下载进度、日志尾部与硬件监控快照；
+  - 握手自动回填云端已完成任务收据。
+- [x] 完善 `/api/colab/status` 端点支持 1~2s 短轮询。
+- [x] 构建专属监控页面 `src/app/colab/page.tsx`：
+  - 启动与安装流程树 (Pipeline Tree)；
+  - 硬件实时仪表盘 (CPU [含低占用说明] / GPU / 显存 / 网络速度)；
+  - 任务队列卡片流 (进行中、等待中、已完成成片预览)；
+  - 看门狗控制 (续命 / 关机)。
+- [x] **视频进度列表体验升级**：
+  - 增加全选与批量彻底删除（级联清空数据库与本地磁盘产物）；
+  - 就地展开媒体折叠面板 (Accordion)：查看最终商业成片、3x3九宫格大图、各分镜首帧与分段视频；
+  - 就地一键单分镜重做与整片重构 (`/api/colab/redo-shot`)；
+  - **本地目录任务队列消费与任务重生成机制 (`LocalTaskDispatcher`)**：
+    - 建立 `data/local_tasks/pending/`、`dispatched/`、`failed/` 目录；
+    - 离线保护：无论五判官生图还是视频生成，Colab 离线时不触发网络请求，安全暂存本地；
+    - 开机感应：Colab 握手就绪且通信健康后自动消费并推送至云端；
+    - 列表卡片感知：展示“本地队列就绪”徽章并提供「重新生成任务」按钮，防云端掉线或卡死。
 
 ---
 
-### 阶段 5：WebUI 操作台打磨与成片交付
-> **目标**：极具掌控感的全链路操作体验。
+### 阶段 3：Edge-TTS 配音引擎与 Whisper 时间戳对齐 (已完成核心接入)
+> **目标**：零成本高保真配音与毫秒级字幕对齐。
+- [x] 接入 Edge-TTS 客户端模块 (`modules/audio/edge-tts.ts`)，预置晓晓、云希、云健等电商爆款音色与 +15% 紧凑电商语速；
+- [x] 自动生成带毫秒起止时间戳的 VTT 歌词字幕文件；
+- [ ] Voice Grounding 真实收音滤镜 (EQ + 动态压缩 + 弱底噪)。
 
-- [ ] **完整 WebUI 交互链**：
-  - 商品输入 -> 分镜确认 -> 九宫格强审核 -> 专属 Colab Session 批量生成 (带断线补录) -> 最终成片播放器与批量导出。
+---
+
+### 阶段 4：Gemini 动态模型大脑与九宫格分镜切片工作台
+> **目标**：创意卖点提炼、五判官质检与 3x3 九宫格切片审查。
+- [ ] Gemini 动态模型拉取与分镜生成；
+- [ ] 五判官对抗质检与等长重写；
+- [ ] 9:16 九宫格 `sharp` 几何切片与单格替换审核台；
+- [ ] 人工审核通过门禁机制。
+
+---
+
+### 阶段 5：FFmpeg NVENC 全自动压制与交付闭环
+> **目标**：全流程端到端跑通并输出 commercial-ready 带货短视频。
+- [ ] Tesla T4 `h264_nvenc` 硬件压制流水线；
+- [ ] 卡拉OK字幕、商品角标、AIGC 标识烧录；
+- [ ] 端到端全链路闭环测试与作品瀑布流交付。

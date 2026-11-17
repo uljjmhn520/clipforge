@@ -54,6 +54,7 @@ export function getColabEnv(): NodeJS.ProcessEnv {
 export interface ColabMetrics {
   cpu?: {
     percent: number;
+    note?: string;
   };
   ram?: {
     usedMb: number;
@@ -67,31 +68,61 @@ export interface ColabMetrics {
     memoryTotalMb: number;
     memoryPercent: number;
   };
+  net?: {
+    downloadSpeedMbps: number;
+  };
+}
+
+export interface InstallProgress {
+  stage: string;
+  percent: number;
+  speed_mbps: number;
+  message: string;
+  log_tail: string[];
 }
 
 export interface ColabHeartbeatStatus {
   online: boolean;
+  sessionName: string;
+  lifecycle: "INIT_BOOT" | "RPC_READY" | "INSTALLING_MODELS" | "IDLE" | "BUSY" | "OFFLINE";
   state: "IDLE" | "BUSY" | "INIT" | "OFFLINE";
   currentTaskId: string | null;
+  currentTask?: any;
+  pendingTasksCount: number;
   gpuMemoryUsedMb: number;
   gpuMemoryTotalMb: number;
   idleSecondsLeft: number;
-  lastProcessedLine: number;
+  isWatchdogFrozen: boolean;
   lastPingTimestamp: number;
   isPoweringOn: boolean;
   lastInitStep?: string;
-  metrics?: ColabMetrics;
+  installProgress: InstallProgress;
+  metrics: ColabMetrics;
+  recentTasks: Array<{
+    taskId: string;
+    taskType: string;
+    status: "running" | "completed" | "failed";
+    percent?: number;
+    message?: string;
+    outputFile?: string;
+    elapsedSec?: number;
+    timestamp: number;
+  }>;
 }
 
 export interface VideoTaskPayload {
   taskId: string;
+  taskType?: "video_gen" | "image_grid_gen";
   type?: "video" | "image";
   prompt: string;
   durationSec?: number;
+  steps?: number;
+  use4StepLora?: boolean;
   keyframeBase64?: string;
+  keyframePath?: string;
   refImages?: string[];
   shots?: any[];
-  driveOutputPath: string;
+  driveOutputPath?: string;
 }
 
 export class ColabRpcClient extends EventEmitter {
@@ -102,17 +133,35 @@ export class ColabRpcClient extends EventEmitter {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private isPoweringOn: boolean = false;
   private isConnecting: boolean = false;
+  private hasCheckedRemoteScripts: boolean = false;
   private lastAutoDiscoveryTimestamp: number = 0;
   private currentStatus: ColabHeartbeatStatus = {
     online: false,
+    sessionName: "clipforge_helloworld1234",
+    lifecycle: "OFFLINE",
     state: "OFFLINE",
     currentTaskId: null,
+    pendingTasksCount: 0,
     gpuMemoryUsedMb: 0,
-    gpuMemoryTotalMb: 0,
-    idleSecondsLeft: -1,
-    lastProcessedLine: 0,
+    gpuMemoryTotalMb: 22937,
+    idleSecondsLeft: 300,
+    isWatchdogFrozen: false,
     lastPingTimestamp: 0,
     isPoweringOn: false,
+    installProgress: {
+      stage: "init",
+      percent: 0,
+      speed_mbps: 0.0,
+      message: "等待 Colab 实例启动...",
+      log_tail: [],
+    },
+    metrics: {
+      cpu: { percent: 0, note: "GPU 推理或网络下载中，CPU 负载较低属正常现象" },
+      ram: { usedMb: 0, totalMb: 0, percent: 0 },
+      gpu: { name: "NVIDIA L4", utilizationPercent: 0, memoryUsedMb: 0, memoryTotalMb: 22937, memoryPercent: 0 },
+      net: { downloadSpeedMbps: 0 },
+    },
+    recentTasks: [],
   };
   private consecutiveMissedPings = 0;
 
@@ -123,6 +172,7 @@ export class ColabRpcClient extends EventEmitter {
   }) {
     super();
     this.sessionName = options?.sessionName || process.env.COLAB_SESSION_NAME || "clipforge_helloworld1234";
+    this.currentStatus.sessionName = this.sessionName;
     this.execTimeoutSec = options?.execTimeoutSec || Number(process.env.COLAB_EXEC_TIMEOUT_SECONDS) || 600;
     this.heartbeatIntervalSec = options?.heartbeatIntervalSec || Number(process.env.COLAB_HEARTBEAT_INTERVAL_SECONDS) || 15;
   }
@@ -145,7 +195,6 @@ export class ColabRpcClient extends EventEmitter {
       runner.on("close", (code) => {
         clearTimeout(timer);
         if (code === 0 && stdout.includes(this.sessionName)) {
-          // 提取硬件信息
           const line = stdout.split("\n").find((l) => l.includes(this.sessionName)) || "";
           resolve({ isRunning: true, hardware: line, statusText: "RUNNING" });
         } else {
@@ -181,7 +230,6 @@ export class ColabRpcClient extends EventEmitter {
    * 获取当前 Colab 节点的实时健康与监控数据
    */
   public getStatus(): ColabHeartbeatStatus {
-    // 若离线且超过 30s 未探测，触发异步后台探活
     if (!this.currentStatus.online && !this.isPoweringOn && !this.process && (Date.now() - this.lastAutoDiscoveryTimestamp > 30000)) {
       this.autoDiscover().catch(() => {});
     }
@@ -195,7 +243,6 @@ export class ColabRpcClient extends EventEmitter {
    * 一键开机：带并发互斥锁、前置运行检测与两阶段协议先行引导
    */
   public async powerOn(gpu = "L4"): Promise<{ success: boolean; alreadyRunning?: boolean; message: string }> {
-    // 1. 并发互斥锁拦截
     if (this.isPoweringOn) {
       return { success: false, message: "实例正在启动初始化中，请勿重复操作！" };
     }
@@ -204,7 +251,6 @@ export class ColabRpcClient extends EventEmitter {
     this.emit("status_change", this.getStatus());
 
     try {
-      // 2. 前置检测会话是否已存在运行
       console.log(`[COLAB-POWER] 检查会话 ${this.sessionName} 是否已在运行中...`);
       const existing = await this.checkSessionRunning();
       if (existing.isRunning) {
@@ -219,10 +265,9 @@ export class ColabRpcClient extends EventEmitter {
         };
       }
 
-      // 3. 实例未运行，执行 colab new 开机
       console.log(`[COLAB-POWER] 正在启动全新专属 Colab 实例: ${this.sessionName} (GPU: ${gpu})...`);
       
-      const newResult = await new Promise<{ success: boolean; message: string }>((resolve) => {
+      await new Promise<{ success: boolean; message: string }>((resolve) => {
         const runner = spawn("colab", ["new", "-s", this.sessionName, "--gpu", gpu], {
           env: getColabEnv(),
         });
@@ -241,20 +286,12 @@ export class ColabRpcClient extends EventEmitter {
         });
 
         runner.on("error", (err) => {
-          console.warn(`[COLAB-POWER] 调用 colab new 异常: ${err.message}`);
-          resolve({ success: false, message: `调用 colab new 失败: ${err.message}` });
+          console.warn(`[COLAB-POWER] 触发 colab new 异常: ${err.message}`);
+          resolve({ success: false, message: err.message });
         });
       });
 
-      if (!newResult.success) {
-        this.isPoweringOn = false;
-        this.emit("status_change", this.getStatus());
-        return newResult;
-      }
-
-      // 4. 【阶段一：零依赖双向协议秒级就绪】
-      // 开机后优先强制上传协议文件并建立 SSH 双向长连接
-      console.log(`[COLAB-POWER] 优先上传协议脚本并建立长连接...`);
+      // 同步脚本并启动通信服务
       await this.ensureRemoteScripts(true);
       await this.connect();
 
@@ -296,16 +333,14 @@ export class ColabRpcClient extends EventEmitter {
       });
 
       runner.on("error", (err) => {
-        console.warn(`[COLAB-UPLOAD] 上传异常: ${err.message}`);
+        console.warn(`[COLAB-UPLOAD] 调用 colab upload 失败: ${err.message}`);
         resolve(false);
       });
     });
   }
 
-  private hasCheckedRemoteScripts = false;
-
   /**
-   * 自动自愈同步：确保 Colab 远端所需脚本 (/content/runner.py 等) 已同步部署
+   * 同步最新云端 runner.py、setup_env.sh、minimax_engine.py
    */
   public async ensureRemoteScripts(force = false): Promise<boolean> {
     if (this.hasCheckedRemoteScripts && !force) return true;
@@ -325,7 +360,7 @@ export class ColabRpcClient extends EventEmitter {
   }
 
   /**
-   * 启动与 Colab 专属 Session 的 OpenSSH 交互子进程 (替换原阻塞式 colab exec)
+   * 启动与 Colab 专属 Session 的 OpenSSH 交互子进程
    */
   public async connect(): Promise<void> {
     if (this.process || this.isConnecting) return;
@@ -339,7 +374,6 @@ export class ColabRpcClient extends EventEmitter {
       console.warn(`[COLAB-RPC] 检查/同步远端脚本异常: ${err.message}`);
     }
 
-    // 派生 colab ssh 命令，使用方案 A 注入的 PYTHONPATH 驱动 OpenSSH 隧道
     const args = ["ssh", "-s", this.sessionName, "--", "python3", "/content/runner.py"];
     
     try {
@@ -362,13 +396,12 @@ export class ColabRpcClient extends EventEmitter {
       });
 
       this.process.on("error", (err) => {
-        console.warn(`[COLAB-RPC] 进程异常 (colab CLI 未安装或未启动?): ${err.message}`);
+        console.warn(`[COLAB-RPC] 进程异常: ${err.message}`);
         this.process = null;
         this.isConnecting = false;
         this.setOffline();
       });
 
-      // 启动主动 Ping-Pong 心跳定时器
       this.startHeartbeat();
     } catch (err: any) {
       console.warn(`[COLAB-RPC] 启动子进程失败: ${err.message}`);
@@ -379,17 +412,11 @@ export class ColabRpcClient extends EventEmitter {
     }
   }
 
-  /**
-   * 定时发送 Ping 帧
-   */
   private startHeartbeat(): void {
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-
     this.heartbeatTimer = setInterval(() => {
       this.sendPing();
     }, this.heartbeatIntervalSec * 1000);
-
-    // 立即发一帧测试
     this.sendPing();
   }
 
@@ -419,6 +446,7 @@ export class ColabRpcClient extends EventEmitter {
 
   private setOffline(): void {
     this.currentStatus.online = false;
+    this.currentStatus.lifecycle = "OFFLINE";
     this.currentStatus.state = "OFFLINE";
     this.emit("status_change", this.getStatus());
   }
@@ -438,115 +466,245 @@ export class ColabRpcClient extends EventEmitter {
         // 1. 处理 Ping-Pong 心跳回包
         if (msg.result && msg.result.pong) {
           this.consecutiveMissedPings = 0;
-          this.currentStatus = {
-            online: true,
-            state: msg.result.state || "IDLE",
-            currentTaskId: msg.result.current_task_id || null,
-            gpuMemoryUsedMb: msg.result.gpu_memory_used_mb || msg.result.gpu?.memoryUsedMb || 0,
-            gpuMemoryTotalMb: msg.result.gpu_memory_total_mb || msg.result.gpu?.memoryTotalMb || 0,
-            idleSecondsLeft: msg.result.idle_seconds_left ?? -1,
-            lastProcessedLine: msg.result.last_processed_line || 0,
-            lastPingTimestamp: Date.now(),
-            isPoweringOn: this.isPoweringOn,
-            lastInitStep: this.currentStatus.lastInitStep,
-            metrics: {
+          this.currentStatus.online = true;
+          this.currentStatus.lifecycle = msg.result.lifecycle || this.currentStatus.lifecycle;
+          this.currentStatus.state = msg.result.state || "IDLE";
+          this.currentStatus.currentTaskId = msg.result.currentTask?.taskId || msg.result.current_task_id || null;
+          this.currentStatus.currentTask = msg.result.currentTask;
+          this.currentStatus.idleSecondsLeft = msg.result.idleSecondsLeft ?? msg.result.idle_seconds_left ?? this.currentStatus.idleSecondsLeft;
+          if (msg.result.gpu_memory_used_mb !== undefined) {
+            this.currentStatus.gpuMemoryUsedMb = msg.result.gpu_memory_used_mb;
+          }
+          if (msg.result.gpu_memory_total_mb !== undefined) {
+            this.currentStatus.gpuMemoryTotalMb = msg.result.gpu_memory_total_mb;
+          }
+          if (msg.result.last_processed_line !== undefined) {
+            (this.currentStatus as any).lastProcessedLine = msg.result.last_processed_line;
+          }
+          this.currentStatus.lastPingTimestamp = Date.now();
+          if (msg.result.installProgress) {
+            this.currentStatus.installProgress = msg.result.installProgress;
+          }
+          if (msg.result.hardware) {
+            this.updateHardware(msg.result.hardware);
+          }
+          if (msg.result.cpu || msg.result.ram || msg.result.gpu) {
+            this.updateHardware({
               cpu: msg.result.cpu,
               ram: msg.result.ram,
               gpu: msg.result.gpu,
-            },
-          };
+            });
+          }
           this.emit("status_change", this.getStatus());
         }
 
-        // 2. 处理 Colab 端主动推送的 60s 系统监控指标 (system.metrics)
-        if (msg.method === "system.metrics" && msg.params) {
-          const p = msg.params;
+        // 2. 处理握手事件 (handshake.ready)
+        if (msg.method === "handshake.ready") {
           this.consecutiveMissedPings = 0;
           this.currentStatus.online = true;
-          this.currentStatus.state = p.state || this.currentStatus.state;
-          this.currentStatus.currentTaskId = p.current_task_id;
-          this.currentStatus.idleSecondsLeft = p.idle_seconds_left ?? this.currentStatus.idleSecondsLeft;
+          this.currentStatus.lifecycle = "RPC_READY";
+          this.currentStatus.state = "INIT";
           this.currentStatus.lastPingTimestamp = Date.now();
-          if (p.gpu_memory_used_mb !== undefined) this.currentStatus.gpuMemoryUsedMb = p.gpu_memory_used_mb;
-          if (p.gpu_memory_total_mb !== undefined) this.currentStatus.gpuMemoryTotalMb = p.gpu_memory_total_mb;
-          if (p.cpu || p.ram || p.gpu) {
-            this.currentStatus.metrics = {
-              cpu: p.cpu || this.currentStatus.metrics?.cpu,
-              ram: p.ram || this.currentStatus.metrics?.ram,
-              gpu: p.gpu || this.currentStatus.metrics?.gpu,
-            };
+          if (msg.params?.gpu) {
+            this.currentStatus.metrics.gpu = msg.params.gpu;
           }
-          this.emit("system_metrics", p);
+          if (msg.params?.completedTasks && Array.isArray(msg.params.completedTasks)) {
+            for (const ct of msg.params.completedTasks) {
+              this.emit("task_completed", ct);
+            }
+          }
+          this.emit("handshake_ready", msg.params);
           this.emit("status_change", this.getStatus());
         }
 
-        // 3. 处理流式任务执行进度 (task.progress)
-        if (msg.method === "task.progress" && msg.params) {
-          this.emit("task_progress", msg.params);
-        }
-
-        // 4. 处理环境初始化流式事件 (阶段二受控引导)
+        // 3. 处理环境安装流式事件 (env.progress)
         if (msg.method === "env.progress" && msg.params) {
-          console.log(`[COLAB-ENV] ${msg.params.step}: ${msg.params.message}`);
+          this.currentStatus.lifecycle = "INSTALLING_MODELS";
+          this.currentStatus.installProgress = {
+            ...this.currentStatus.installProgress,
+            ...msg.params,
+          };
           this.currentStatus.lastInitStep = msg.params.message;
-          if (msg.params.gpu) {
-            this.currentStatus.metrics = {
-              ...this.currentStatus.metrics,
-              gpu: msg.params.gpu,
-            };
-          }
           this.emit("env_progress", msg.params);
           this.emit("status_change", this.getStatus());
         }
 
-        // 5. 处理任务完成通知
+        // 4. 处理环境安装就绪 (env.ready)
+        if (msg.method === "env.ready" && msg.params) {
+          this.currentStatus.lifecycle = "IDLE";
+          this.currentStatus.state = "IDLE";
+          this.currentStatus.installProgress.percent = 100;
+          this.currentStatus.installProgress.message = "MiniMax-H3 / Image 推理环境已完全就绪！";
+          if (msg.params.gpu) this.currentStatus.metrics.gpu = msg.params.gpu;
+          this.emit("env_ready", msg.params);
+          this.emit("status_change", this.getStatus());
+        }
+
+        // 5. 处理系统性能与监控指标 (system.metrics)
+        if (msg.method === "system.metrics" && msg.params) {
+          const p = msg.params;
+          this.consecutiveMissedPings = 0;
+          this.currentStatus.online = true;
+          this.currentStatus.lifecycle = p.lifecycle || this.currentStatus.lifecycle;
+          this.currentStatus.state = p.status || p.state || this.currentStatus.state;
+          this.currentStatus.currentTaskId = p.currentTask?.taskId || p.current_task_id || null;
+          this.currentStatus.currentTask = p.currentTask;
+          this.currentStatus.pendingTasksCount = p.pendingTasksCount ?? this.currentStatus.pendingTasksCount;
+          if (p.idle_seconds_left !== undefined) {
+            this.currentStatus.idleSecondsLeft = p.idle_seconds_left;
+          }
+          if (p.watchdog) {
+            this.currentStatus.idleSecondsLeft = p.watchdog.idleSecondsLeft ?? this.currentStatus.idleSecondsLeft;
+            this.currentStatus.isWatchdogFrozen = p.watchdog.isFrozen ?? false;
+          }
+          if (p.gpu_memory_used_mb !== undefined) this.currentStatus.gpuMemoryUsedMb = p.gpu_memory_used_mb;
+          if (p.gpu_memory_total_mb !== undefined) this.currentStatus.gpuMemoryTotalMb = p.gpu_memory_total_mb;
+          if (p.installProgress) {
+            this.currentStatus.installProgress = p.installProgress;
+          }
+          if (p.hardware) {
+            this.updateHardware(p.hardware);
+          }
+          if (p.cpu || p.ram || p.gpu) {
+            this.updateHardware({ cpu: p.cpu, ram: p.ram, gpu: p.gpu, net: p.net });
+          }
+          this.currentStatus.lastPingTimestamp = Date.now();
+          this.emit("system_metrics", p);
+          this.emit("status_change", this.getStatus());
+        }
+
+        // 6. 处理任务流式进度 (task.started / task.progress / task.completed / task.failed)
+        if (msg.method === "task.started" && msg.params) {
+          this.currentStatus.lifecycle = "BUSY";
+          this.currentStatus.state = "BUSY";
+          this.currentStatus.currentTaskId = msg.params.taskId;
+          this.addRecentTask({
+            taskId: msg.params.taskId,
+            taskType: msg.params.taskType,
+            status: "running",
+            percent: 5,
+            message: "任务开始执行...",
+            timestamp: Date.now(),
+          });
+          this.emit("task_started", msg.params);
+          this.emit("status_change", this.getStatus());
+        }
+
+        if (msg.method === "task.progress" && msg.params) {
+          this.updateRecentTask(msg.params.taskId, {
+            percent: msg.params.percent,
+            message: msg.params.message,
+          });
+          this.emit("task_progress", msg.params);
+          this.emit("status_change", this.getStatus());
+        }
+
         if (msg.method === "task.completed" && msg.params) {
-          console.log(`[COLAB-RPC] 收到任务完成通知: ${msg.params.task_id}`);
+          this.currentStatus.lifecycle = "IDLE";
+          this.currentStatus.state = "IDLE";
+          this.currentStatus.currentTaskId = null;
+          this.updateRecentTask(msg.params.taskId, {
+            status: "completed",
+            percent: 100,
+            outputFile: msg.params.outputFile,
+            elapsedSec: msg.params.elapsedSec,
+            message: "任务执行成功落盘！",
+          });
           this.emit("task_completed", msg.params);
+          this.emit("status_change", this.getStatus());
+        }
+
+        if (msg.method === "task.failed" && msg.params) {
+          this.currentStatus.lifecycle = "IDLE";
+          this.currentStatus.state = "IDLE";
+          this.currentStatus.currentTaskId = null;
+          this.updateRecentTask(msg.params.taskId, {
+            status: "failed",
+            message: msg.params.error || "任务执行失败",
+          });
+          this.emit("task_failed", msg.params);
+          this.emit("status_change", this.getStatus());
         }
       } catch {
-        // 忽略非 JSON 的常规终端打印
+        // 忽略非 JSON 日志行
       }
     }
   }
 
-  /**
-   * 将新任务追加 (append) 写入 Colab 实例的 /content/inbox.jsonl
-   */
-  public async pushTaskToInbox(task: VideoTaskPayload): Promise<void> {
-    if (process.env.VITEST) {
-      return;
+  private updateHardware(hw: any) {
+    if (hw.cpu) {
+      this.currentStatus.metrics.cpu = {
+        percent: hw.cpu.percent ?? 0,
+        note: hw.cpu.note || "GPU 推理或网络下载中，CPU 负载较低属正常现象",
+      };
     }
+    if (hw.ram) {
+      this.currentStatus.metrics.ram = hw.ram;
+    }
+    if (hw.gpu) {
+      this.currentStatus.metrics.gpu = hw.gpu;
+      this.currentStatus.gpuMemoryUsedMb = hw.gpu.memoryUsedMb || 0;
+      this.currentStatus.gpuMemoryTotalMb = hw.gpu.memoryTotalMb || 22937;
+    }
+    if (hw.net) {
+      this.currentStatus.metrics.net = hw.net;
+    }
+  }
 
+  private addRecentTask(task: any) {
+    const list = this.currentStatus.recentTasks.filter((t) => t.taskId !== task.taskId);
+    list.unshift(task);
+    this.currentStatus.recentTasks = list.slice(0, 10);
+  }
+
+  private updateRecentTask(taskId: string, patch: any) {
+    const item = this.currentStatus.recentTasks.find((t) => t.taskId === taskId);
+    if (item) {
+      Object.assign(item, patch);
+    }
+  }
+
+  /**
+   * 将新任务存入云端 /content/tasks/pending/ 目录队列
+   */
+  public async pushTaskToPendingDir(task: VideoTaskPayload): Promise<void> {
+    if (process.env.VITEST) return;
+
+    const taskType = task.taskType || (task.type === "image" ? "image_grid_gen" : "video_gen");
     const payload = {
-      task_id: task.taskId,
-      type: task.type || "video",
-      prompt: task.prompt,
-      duration_sec: task.durationSec || 5,
-      keyframe_b64: task.keyframeBase64 || null,
-      ref_images: task.refImages || null,
-      shots: task.shots || null,
-      drive_output_path: task.driveOutputPath,
-      enqueued_at: Date.now(),
+      taskId: task.taskId,
+      taskType: taskType,
+      params: {
+        prompt: task.prompt,
+        durationSec: task.durationSec || 4.0,
+        steps: task.steps || 4,
+        use4StepLora: task.use4StepLora ?? true,
+        keyframeBase64: task.keyframeBase64 || null,
+        keyframePath: task.keyframePath || null,
+        refImages: task.refImages || null,
+        shots: task.shots || null,
+      },
+      driveOutputDir: task.driveOutputPath || "/content/drive/MyDrive/ClipForge/outputs",
+      createdAt: Date.now(),
     };
 
-    console.log(`[COLAB-RPC] 向云端追加任务: ${task.taskId} (类型: ${task.type || 'video'})`);
+    console.log(`[COLAB-QUEUE] 投递任务到目录队列: ${task.taskId} (${taskType})`);
 
-    // 优先通过已建立的 SSH stdio 管道高速下发 (避免并发第二条 SSH 触发 Colab 429 独占限制)
+    // 优先通过 stdio RPC 投递
     if (this.process && this.process.stdin.writable) {
       const frame = {
         jsonrpc: "2.0",
-        id: `task_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-        method: "task.enqueue",
+        id: `task_${Date.now()}`,
+        method: "task.submit",
         params: payload,
       };
       this.process.stdin.write(JSON.stringify(frame) + "\n");
       return;
     }
 
-    // 兜底方案：在无长连接时通过 stdin 管道写入 /content/inbox.jsonl (规避命令行长度限制与转义损坏)
+    // 兜底方案：通过 SSH 写入 /content/tasks/pending/<timestamp>_<taskId>.json
+    const remoteFilePath = `/content/tasks/pending/${Date.now()}_${task.taskId}.json`;
     return new Promise((resolve, reject) => {
-      const line = JSON.stringify(payload);
       const runner = spawn(
         "colab",
         [
@@ -556,72 +714,28 @@ export class ColabRpcClient extends EventEmitter {
           "--",
           "python3",
           "-c",
-          "import sys; open('/content/inbox.jsonl', 'a', encoding='utf-8').write(sys.stdin.read().strip() + '\\n')",
+          `import sys, os; os.makedirs('/content/tasks/pending', exist_ok=True); open('${remoteFilePath}', 'w', encoding='utf-8').write(sys.stdin.read().strip())`,
         ],
-        {
-          env: getColabEnv(),
-          stdio: ["pipe", "pipe", "pipe"],
-        }
+        { env: getColabEnv() }
       );
 
-      runner.stdin.write(line);
+      runner.stdin.write(JSON.stringify(payload, null, 2));
       runner.stdin.end();
 
-      const timer = setTimeout(() => {
-        try {
-          runner.kill();
-        } catch (_) {}
-        resolve();
-      }, 15000);
-
       runner.on("close", (code) => {
-        clearTimeout(timer);
         if (code === 0) resolve();
-        else reject(new Error(`写入 inbox.jsonl 失败，退出码: ${code}`));
+        else reject(new Error(`写入任务文件失败，退出码: ${code}`));
       });
-      runner.on("error", (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
+
+      runner.on("error", (err) => reject(err));
     });
   }
 
   /**
-   * 通过 colab ssh 执行非阻塞一次性远端命令并获取输出
+   * 兼容向后调用的 pushTaskToInbox
    */
-  public async execCommand(
-    command: string
-  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-    return new Promise((resolve) => {
-      const runner = spawn("colab", ["ssh", "-s", this.sessionName, "--", command], {
-        env: getColabEnv(),
-        stdio: ["ignore", "pipe", "pipe"],
-      });
-      let stdout = "";
-      let stderr = "";
-
-      const timer = setTimeout(() => {
-        try {
-          runner.kill();
-        } catch (_) {}
-        resolve({ stdout, stderr: "TIMEOUT", exitCode: -1 });
-      }, 15000);
-
-      runner.stdout.on("data", (d) => {
-        stdout += d.toString();
-      });
-      runner.stderr.on("data", (d) => {
-        stderr += d.toString();
-      });
-      runner.on("close", (code) => {
-        clearTimeout(timer);
-        resolve({ stdout, stderr, exitCode: code ?? -1 });
-      });
-      runner.on("error", (err) => {
-        clearTimeout(timer);
-        resolve({ stdout, stderr: err.message, exitCode: -1 });
-      });
-    });
+  public async pushTaskToInbox(task: VideoTaskPayload): Promise<void> {
+    return this.pushTaskToPendingDir(task);
   }
 
   /**
@@ -645,7 +759,6 @@ export class ColabRpcClient extends EventEmitter {
     console.log(`[COLAB-DOWNLOAD] 开始下载云端产物: ${remotePath} -> ${localFilePath}`);
 
     return new Promise((resolve) => {
-      // 派生 colab download <remotePath> <localFilePath> -s <sessionName>
       const runner = spawn(
         "colab",
         ["download", remotePath, localFilePath, "-s", this.sessionName],
@@ -685,8 +798,8 @@ export class ColabRpcClient extends EventEmitter {
     const frame = {
       jsonrpc: "2.0",
       id: `ka_${Date.now()}`,
-      method: "colab.keep_alive",
-      params: { minutes: extraMinutes },
+      method: "watchdog.extend",
+      params: { seconds: extraMinutes * 60 },
     };
     this.process.stdin.write(JSON.stringify(frame) + "\n");
   }
@@ -699,7 +812,7 @@ export class ColabRpcClient extends EventEmitter {
     const frame = {
       jsonrpc: "2.0",
       id: `term_${Date.now()}`,
-      method: "colab.terminate",
+      method: "watchdog.shutdown",
       params: {},
     };
     this.process.stdin.write(JSON.stringify(frame) + "\n");

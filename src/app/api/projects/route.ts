@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { db } from "@/lib/db";
 import { projects, scripts, compositions, cloudTasks } from "@/lib/db/schema";
-import { desc, eq } from "drizzle-orm";
+import { desc, eq, inArray } from "drizzle-orm";
 import * as path from "path";
 import * as fs from "fs";
 
@@ -40,7 +40,7 @@ export async function GET(req: Request) {
       });
     }
 
-    // 2. 否则返回所有项目的列表概览（包含进度阶段）
+    // 2. 否则返回所有项目的列表概览（包含进度阶段与丰富媒体资源）
     const allProjects = await db.query.projects.findMany({
       orderBy: [desc(projects.createdAt)],
     });
@@ -55,8 +55,17 @@ export async function GET(req: Request) {
           where: eq(compositions.projectId, p.id),
         });
 
+        const projectTasks = await db.query.cloudTasks.findMany({
+          where: eq(cloudTasks.projectId, p.id),
+        });
+
+        const waitingTaskCount = projectTasks.filter(
+          (t) => t.state === "waiting_for_cloud" || t.state === "submitted_to_inbox"
+        ).length;
+        const hasWaitingTasks = waitingTaskCount > 0;
+
         // 计算当前步骤 (1~5)
-        let step = 1; // 1: 商品基本信息
+        let step = 1;
         let stepLabel = "草稿待生成";
         if (p.status === "completed") {
           step = 5;
@@ -81,6 +90,68 @@ export async function GET(req: Request) {
           stepLabel = "分镜剧本已生成";
         }
 
+        // 探测成片地址
+        const finalVideoPath = path.join(process.cwd(), "public", "outputs", p.id, "final_video.mp4");
+        const videoUrl = fs.existsSync(finalVideoPath) || c?.outputPath
+          ? `/outputs/${p.id}/final_video.mp4`
+          : null;
+
+        // 探测九宫格大图
+        let gridImageUrl: string | null = null;
+        const uploadDir = path.join(process.cwd(), "public", "uploads", p.id);
+        if (fs.existsSync(uploadDir)) {
+          const files = fs.readdirSync(uploadDir);
+          const gridFile = files.find(f => f.startsWith("grid") || f.includes("nine_grid"));
+          if (gridFile) {
+            gridImageUrl = `/uploads/${p.id}/${gridFile}`;
+          }
+        }
+
+        // 探测各镜头关键帧切片与分段视频
+        const shots = (s?.shots || []).map((shot: any) => {
+          let keyframeUrl: string | null = null;
+          let clipUrl: string | null = null;
+
+          // 探测切片关键帧
+          const sliceNames = [
+            `shot_0${shot.id}.png`,
+            `shot_${shot.id}.png`,
+            `shot_0${shot.id}.jpg`,
+            `shot_${shot.id}.jpg`,
+          ];
+          for (const sName of sliceNames) {
+            const sp = path.join(uploadDir, "slices", sName);
+            if (fs.existsSync(sp)) {
+              keyframeUrl = `/uploads/${p.id}/slices/${sName}`;
+              break;
+            }
+          }
+
+          // 探测分镜视频片段
+          const clipDir = path.join(process.cwd(), "public", "outputs", p.id, "clips");
+          if (fs.existsSync(clipDir)) {
+            const clipFiles = fs.readdirSync(clipDir);
+            const matchedClip = clipFiles.find(f => 
+              f.includes(`shot_${shot.id}.mp4`) || 
+              f.includes(`shot_0${shot.id}.mp4`) ||
+              (clipFiles.length === 1 && f.endsWith(".mp4"))
+            );
+            if (matchedClip) {
+              clipUrl = `/outputs/${p.id}/clips/${matchedClip}`;
+            }
+          }
+
+          return {
+            id: shot.id,
+            description: shot.description,
+            voiceover: shot.voiceover,
+            durationSec: shot.durationSec,
+            keyframeUrl,
+            clipUrl,
+            isClipReady: !!clipUrl,
+          };
+        });
+
         return {
           id: p.id,
           name: p.name,
@@ -90,9 +161,13 @@ export async function GET(req: Request) {
           status: p.status,
           step,
           stepLabel,
-          shotsCount: s?.shots?.length || 0,
+          shotsCount: shots.length,
+          shots,
+          gridImageUrl,
+          hasWaitingTasks,
+          waitingTaskCount,
           externalPrompt: s?.externalPrompt || null,
-          videoUrl: c?.outputPath ? `/outputs/${p.id}/final_video.mp4` : null,
+          videoUrl,
           createdAt: p.createdAt,
           updatedAt: p.updatedAt,
         };
@@ -107,26 +182,54 @@ export async function GET(req: Request) {
 
 export async function DELETE(req: Request) {
   try {
+    let idsToDelete: string[] = [];
+
+    // 1. 尝试从 URL 参数解析单个 id
     const { searchParams } = new URL(req.url);
-    const projectId = searchParams.get("id");
-
-    if (!projectId) {
-      return NextResponse.json({ error: "缺少 projectId 参数" }, { status: 400 });
+    const singleId = searchParams.get("id");
+    if (singleId) {
+      idsToDelete.push(singleId);
+    } else {
+      // 2. 尝试从 JSON Body 解析批量 ids
+      try {
+        const body = await req.json();
+        if (body.ids && Array.isArray(body.ids)) {
+          idsToDelete = body.ids;
+        }
+      } catch {
+        // 请求体为空时忽略
+      }
     }
 
-    // 级联清理本地生成的文件与目录
-    const projectDir = path.join(process.cwd(), "public", "outputs", projectId);
-    if (fs.existsSync(projectDir)) {
-      fs.rmSync(projectDir, { recursive: true, force: true });
+    if (idsToDelete.length === 0) {
+      return NextResponse.json({ error: "缺少待删除的项目 ID (id 或 ids)" }, { status: 400 });
     }
 
-    // 级联清理数据库记录
-    await db.delete(compositions).where(eq(compositions.projectId, projectId));
-    await db.delete(cloudTasks).where(eq(cloudTasks.projectId, projectId));
-    await db.delete(scripts).where(eq(scripts.projectId, projectId));
-    await db.delete(projects).where(eq(projects.id, projectId));
+    for (const projectId of idsToDelete) {
+      // 级联清理本地磁盘生成的视频产物
+      const outputDir = path.join(process.cwd(), "public", "outputs", projectId);
+      if (fs.existsSync(outputDir)) {
+        fs.rmSync(outputDir, { recursive: true, force: true });
+      }
 
-    return NextResponse.json({ success: true, message: `项目 ${projectId} 及其关联资源已成功彻底删除` });
+      // 级联清理本地上传的切片与九宫格
+      const uploadDir = path.join(process.cwd(), "public", "uploads", projectId);
+      if (fs.existsSync(uploadDir)) {
+        fs.rmSync(uploadDir, { recursive: true, force: true });
+      }
+    }
+
+    // 级联清理 SQLite 数据库记录
+    await db.delete(compositions).where(inArray(compositions.projectId, idsToDelete));
+    await db.delete(cloudTasks).where(inArray(cloudTasks.projectId, idsToDelete));
+    await db.delete(scripts).where(inArray(scripts.projectId, idsToDelete));
+    await db.delete(projects).where(inArray(projects.id, idsToDelete));
+
+    return NextResponse.json({
+      success: true,
+      deletedCount: idsToDelete.length,
+      message: `已成功彻底删除 ${idsToDelete.length} 个视频项目及其关联的所有磁盘文件`,
+    });
   } catch (error: any) {
     return NextResponse.json({ error: error.message }, { status: 500 });
   }
