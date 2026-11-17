@@ -309,8 +309,8 @@ export class ColabRpcClient extends EventEmitter {
    */
   public async ensureRemoteScripts(force = false): Promise<boolean> {
     if (this.hasCheckedRemoteScripts && !force) return true;
-    console.log(`[COLAB-RPC] 正在同步 colab/ 脚本到云端 (/content/runner.py, minimax_engine.py)...`);
-    const scriptFiles = ["runner.py", "bootstrap.py", "minimax_engine.py"];
+    console.log(`[COLAB-RPC] 正在同步 colab/ 脚本到云端 (/content/runner.py, minimax_engine.py, setup_env.sh)...`);
+    const scriptFiles = ["runner.py", "bootstrap.py", "minimax_engine.py", "setup_env.sh"];
     const colabDir = path.join(process.cwd(), "colab");
 
     for (const file of scriptFiles) {
